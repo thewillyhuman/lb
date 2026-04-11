@@ -1,0 +1,21 @@
+[package]
+name = "lb-health"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lb-types = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+thiserror = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rcgen = "0.13"

@@ -1,0 +1,296 @@
+# Operations Guide
+
+## Running the LB node
+
+```bash
+lb-node --config /etc/lb/config.toml
+```
+
+The node loads the TOML configuration, reads the LB config JSON file (VIPs + pools), starts the multi-threaded forwarder, and begins watching the config file for changes. It does not announce VIPs via BGP until the initial configuration is loaded and validated.
+
+## Configuration reference
+
+The LB node uses two configuration files:
+
+1. **Node config** (`config.toml`) -- per-node settings: BGP, forwarder tuning, health check defaults. Read once at startup.
+2. **LB config** (`lb-config.json`) -- VIPs and backend pools. Watched via inotify and reloaded atomically on change (see [ADR-001](adr-001-configuration-model.md)).
+
+### Node config (TOML)
+
+#### `[node]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `id` | string | -- | Unique node identifier |
+| `loopback_ip` | string | -- | Node's stable IP, used as GRE outer source |
+| `data_iface` | string | -- | NIC used for packet forwarding |
+| `num_threads` | integer | `7` | Number of packet rewriter threads |
+
+#### `[bgp]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `local_asn` | integer | -- | Local BGP AS number |
+| `router_id` | string | -- | BGP router ID (typically same as `loopback_ip`) |
+| `peer_ip` | string | -- | BGP peer (upstream router) IP |
+| `peer_asn` | integer | -- | BGP peer AS number |
+| `communities` | list | `[]` | BGP community strings to attach to announcements |
+| `next_hop_self` | bool | `true` | Rewrite next-hop to self in BGP updates |
+
+#### `[control_plane]`
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `config_file` | string | Path to the LB config JSON file (VIPs + pools) |
+| `local_cache` | string | Path for caching the last validated config |
+
+#### `[forwarder]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `packet_pool_size` | integer | `4096` | Number of pre-allocated packet buffers |
+| `connection_table_size` | integer | `131072` | Per-thread connection table entries (power of two, >= 2x peak concurrent flows). Uses Robin Hood hashing; keep fill ratio below 50% to bound probe length |
+| `fragment_table_size` | integer | `8192` | Fragment reassembly table entries |
+| `batch_size` | integer | `64` | Packets per batch in RX/TX |
+| `batch_flush_interval` | string | `"50us"` | Max time before flushing a partial batch |
+| `connection_ttl` | string | `"60s"` | Time before idle connections are evicted |
+
+#### `[health_check_defaults]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `interval` | string | `"5s"` | Time between health probes |
+| `timeout` | string | `"2s"` | Probe timeout |
+| `healthy_threshold` | integer | `2` | Consecutive successes to mark healthy |
+| `unhealthy_threshold` | integer | `3` | Consecutive failures to mark unhealthy |
+
+### LB config (JSON)
+
+The LB config file defines VIPs and backend pools. It is the file watched by inotify.
+
+```json
+{
+  "vips": [
+    {
+      "id": "web-vip",
+      "address": "188.184.100.10",
+      "services": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "backend_pool": "web-pool"
+        }
+      ],
+      "owner": "web-team",
+      "description": "Public HTTPS VIP"
+    }
+  ],
+  "pools": [
+    {
+      "id": "web-pool",
+      "backends": [
+        { "ip": "10.0.0.1", "port": 443, "weight": 1 },
+        { "ip": "10.0.0.2", "port": 443, "weight": 1 }
+      ],
+      "health_check": {
+        "interval": "5s",
+        "timeout": "2s",
+        "healthy_threshold": 2,
+        "unhealthy_threshold": 3
+      }
+    }
+  ]
+}
+```
+
+## Configuration management
+
+Per [ADR-001](adr-001-configuration-model.md), the LB config is a local file. How it is generated and deployed is the responsibility of existing tooling (Puppet, Ansible, Foreman).
+
+### Generating a config
+
+```bash
+# Generate an empty scaffold
+./deploy/generate-config.sh --scaffold -o /etc/lb/lb-config.json
+
+# Merge VIP and pool definitions
+./deploy/generate-config.sh -v vips.json -p pools.json -o /etc/lb/lb-config.json
+```
+
+### Validating a config
+
+Always validate before deploying:
+
+```bash
+./deploy/validate-config.sh /etc/lb/lb-config.json
+./deploy/validate-config.sh --strict /etc/lb/lb-config.json
+```
+
+Checks performed:
+- JSON syntax
+- Required fields present
+- No dangling pool references (VIP references a pool that doesn't exist)
+- No empty backend pools
+- Valid IP addresses
+
+### Deploying to nodes
+
+```bash
+# Deploy to specific nodes
+./deploy/deploy-config.sh -c lb-config.json -n node1.cern.ch,node2.cern.ch
+
+# Deploy using a hosts file
+./deploy/deploy-config.sh -c lb-config.json -f nodes.txt
+
+# Dry run
+./deploy/deploy-config.sh -c lb-config.json -n node1.cern.ch --dry-run
+```
+
+The deploy script:
+1. Validates the config locally
+2. Copies via `scp` to a temp file on the target
+3. Atomic `mv` on the target (inotify detects this and triggers reload)
+
+### Config reload behavior
+
+When the config file changes:
+- The watcher detects the file modification via inotify (Linux) or kqueue (macOS)
+- The new file is parsed and validated
+- If valid: VIP matcher and lookup tables are rebuilt and swapped atomically via `ArcSwap`. In-flight packets are never dropped.
+- If invalid: the change is logged and skipped. The previous config remains active.
+
+## Health checking
+
+The LB node runs health checks against all backends. Supported probe types:
+
+| Type | Description |
+|------|-------------|
+| TCP | Connects to `ip:port`. Success if connection is established. |
+| HTTP | Sends `GET <path>`. Success if response is 2xx. |
+| HTTPS | TLS handshake + `GET <path>`. Success if response is 2xx. Supports self-signed certs via insecure mode. |
+
+Health state machine:
+```
+UNKNOWN ──(N successes)──> HEALTHY
+UNKNOWN ──(M failures)──> UNHEALTHY
+HEALTHY ──(M failures)──> UNHEALTHY
+UNHEALTHY ──(N successes)──> HEALTHY
+```
+
+When a backend becomes unhealthy:
+1. It is removed from the Maglev lookup table (rebuilt atomically)
+2. Existing connections in the connection table that point to it will be re-hashed on next packet
+3. The VIP is withdrawn via BGP if all backends in all pools are unhealthy
+
+When a backend recovers:
+1. It is added back to the lookup table
+2. Maglev's minimal disruption property ensures most existing connections are unaffected
+
+## Monitoring
+
+### Health endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /healthz` | Process is alive. Returns 200. |
+| `GET /readyz` | Config loaded and forwarder running. Returns 200 or 503. |
+
+### Prometheus metrics
+
+Available at `GET /metrics`. Key metrics:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `lb_packets_received_total` | counter | Total packets received by the steering module |
+| `lb_packets_forwarded_total` | counter | Packets successfully GRE-forwarded |
+| `lb_packets_dropped_total` | counter | Packets dropped (no VIP match, parse error, etc.) |
+| `lb_connection_table_hits_total` | counter | Connection tracking cache hits |
+| `lb_connection_table_misses_total` | counter | Connection tracking cache misses (triggers hash lookup) |
+| `lb_connection_table_size` | gauge | Current active entries in connection table |
+| `lb_packet_processing_latency_ns` | histogram | Per-packet processing latency in nanoseconds |
+
+### Structured logging
+
+All logs are emitted via `tracing` with structured fields. Set `RUST_LOG=info` (or `debug`, `trace`) for different verbosity levels. JSON output is available via `tracing-subscriber`'s JSON layer.
+
+## Deployment
+
+### Systemd
+
+A ready-to-use unit file is at `deploy/lb-node.service`. Install it:
+
+```bash
+sudo cp deploy/lb-node.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now lb-node
+```
+
+The unit file includes:
+- Pre-start config validation (`--check-config`)
+- Restart on failure with backoff
+- File descriptor and memory lock limits for kernel bypass
+- Security hardening (ProtectSystem, PrivateTmp, etc.)
+
+### Thread layout
+
+The LB node spawns the following threads:
+
+| Thread | Name | Role |
+|--------|------|------|
+| Steering | `lb-steering` | RX from NIC, allocate pool frames, parse 5-tuple, distribute frame indices to rewriter queues |
+| Rewriter 0..N | `lb-rewriter-{i}` | Connection table lookup, Maglev hash, GRE encapsulation (in-place on pool frame) |
+| Muxer | `lb-muxer` | Drain frame indices from rewriter TX queues, send via NIC, return frames to pool (completion) |
+| Config watcher | `lb-config-watcher` | Watch config file, trigger reload |
+| Main | -- | Monitors thread health, signal handling |
+
+SPSC queues between threads carry 4-byte frame indices (`FrameIndex = u32`), not 2KB packet buffers. Packet data lives in a shared `PacketPool` arena and is mutated in-place by whichever thread holds the index. This eliminates the ~166ns/packet memcpy overhead that dominated inter-thread handoff with full `PacketBuf` queues.
+
+For best performance, pin each thread to a dedicated CPU core and isolate those cores from the OS scheduler.
+
+### Multiple instances
+
+Each LB node is fully independent. There is no shared state between nodes at runtime. Backend selection consistency across nodes is guaranteed by Maglev consistent hashing: given the same configuration, all nodes produce identical lookup tables. Temporary config divergence between nodes is tolerable (see [ADR-001](adr-001-configuration-model.md)).
+
+Deploy LB nodes behind an ECMP router. The router distributes traffic evenly across all nodes. Adding or removing a node only disrupts flows that were hashed to that specific node.
+
+## Troubleshooting
+
+### Node won't start
+
+- **Config parse error** -- validate with `lb-node --config /etc/lb/config.toml --check-config`.
+- **LB config missing** -- the node starts with an empty config and logs a warning. It will begin forwarding once the config file is created.
+- **Port in use** -- check if another process is bound to the configured interface.
+
+### Packets not being forwarded
+
+- Check `lb_packets_received_total` -- if zero, the NIC/IO backend is not receiving traffic.
+- Check `lb_packets_dropped_total` -- if high relative to received, packets are not matching any VIP. Verify VIP config matches the traffic's destination IP, port, and protocol.
+- Check `lb_connection_table_size` -- if zero, no flows are being tracked.
+
+### Backend not receiving traffic
+
+- Check health status -- an unhealthy backend is excluded from the lookup table.
+- Check that the backend can decapsulate GRE (IP protocol 47) and that its loopback interface has the VIP address configured for DSR.
+- Verify GRE connectivity: `ping -I <lb-node-ip> <backend-ip>` (or use `lb-trace` for packet tracing).
+
+### High latency
+
+- Check `lb_packet_processing_latency_ns` histogram for p99 spikes.
+- High connection table miss rate (`lb_connection_table_misses_total`) indicates many new flows or table eviction -- consider increasing `connection_table_size` or `connection_ttl`.
+- Ensure forwarder threads are pinned to isolated CPU cores.
+
+### Health flap causing brief misdirection
+
+When a backend health status changes, the controller rebuilds Maglev lookup tables only for the affected pools (using a reverse index). During the sequential rebuild window (~1.1ms per affected pool), some pools may still reference the stale table. This is safe: the rewriter checks the cached backend's health status on every packet. If the cached backend is unhealthy, it falls back to a fresh Maglev lookup against the already-swapped table.
+
+A backend that appears in many pools (e.g., a shared infrastructure backend in 50 pools) will cause a ~55ms rebuild window. If this latency is problematic, consider splitting shared backends into dedicated instances per pool or reducing `connection_ttl` to flush stale connection table entries faster.
+
+### Correlated failure (rack switch dies)
+
+When multiple backends fail simultaneously (e.g., a rack switch takes 20 servers offline), the controller's debounce mechanism coalesces all health change events within a 50ms window into a single rebuild per affected pool. This avoids rebuilding the same pool multiple times as each backend is marked unhealthy one by one.
+
+- The health status in `DashMap` is updated immediately on each event, so the rewriter's per-packet health check sees the change right away
+- Lookup table rebuilds are deferred until the debounce window elapses, then each affected pool is rebuilt once with all changes applied
+- Benchmarked: 20 backends failing across 50 pools takes ~116ms with debounce vs ~2.37s without (20x improvement)
+
+No configuration is needed -- the 50ms debounce window is built-in. The window is small enough to be imperceptible to traffic (rewriter falls back to Maglev for affected flows immediately) but large enough to capture burst health events from correlated failures.

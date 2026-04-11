@@ -1,0 +1,89 @@
+[workspace]
+members = [
+    "crates/lb-types",
+    "crates/lb-hashing",
+    "crates/lb-io",
+    "crates/lb-forwarder",
+    "crates/lb-metrics",
+    "crates/lb-health",
+    "crates/lb-bgp",
+    "crates/lb-config-manager",
+    "crates/lb-controller",
+    "crates/lb-tracer",
+    "crates/lb-node",
+    "crates/lb-trace",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Workspace crates
+lb-types = { path = "crates/lb-types" }
+lb-hashing = { path = "crates/lb-hashing" }
+lb-io = { path = "crates/lb-io" }
+lb-forwarder = { path = "crates/lb-forwarder" }
+lb-metrics = { path = "crates/lb-metrics" }
+lb-health = { path = "crates/lb-health" }
+lb-bgp = { path = "crates/lb-bgp" }
+lb-config-manager = { path = "crates/lb-config-manager" }
+lb-controller = { path = "crates/lb-controller" }
+lb-tracer = { path = "crates/lb-tracer" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+axum = "0.8"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging / Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Metrics
+prometheus-client = "0.23"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Concurrency
+arc-swap = "1"
+dashmap = "6"
+parking_lot = "0.12"
+crossbeam = "0.8"
+
+# Networking
+ipnet = { version = "2", features = ["serde"] }
+bytes = "1"
+
+# Hashing
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# AF_XDP (Linux kernel bypass)
+libbpf-sys = "1"
+libc = "0.2"
+
+# TLS
+rustls = "0.23"
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+
+# File watching (ADR-001: config from local file)
+notify = "7"
+
+# Utilities
+rand = "0.8"
+criterion = { version = "0.5", features = ["html_reports"] }
+core_affinity = "0.8"

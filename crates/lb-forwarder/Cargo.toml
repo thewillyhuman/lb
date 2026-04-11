@@ -1,0 +1,26 @@
+[package]
+name = "lb-forwarder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lb-types = { workspace = true }
+lb-hashing = { workspace = true }
+lb-io = { workspace = true }
+lb-metrics = { workspace = true }
+arc-swap = { workspace = true }
+dashmap = { workspace = true }
+xxhash-rust = { workspace = true }
+crossbeam = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+rand = { workspace = true }
+prometheus-client = { workspace = true }
+core_affinity = { workspace = true }
+
+[[bench]]
+name = "forwarding_bench"
+harness = false

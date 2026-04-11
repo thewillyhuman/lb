@@ -1,0 +1,19 @@
+[package]
+name = "lb-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["mock"]
+mock = ["dep:crossbeam"]
+af-xdp = ["dep:libbpf-sys", "dep:libc"]
+dpdk = ["dep:libc"]
+
+[dependencies]
+libbpf-sys = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+crossbeam = { workspace = true, optional = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

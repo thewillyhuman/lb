@@ -1,0 +1,26 @@
+[package]
+name = "lb-controller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lb-types = { workspace = true }
+lb-health = { workspace = true }
+lb-bgp = { workspace = true }
+lb-config-manager = { workspace = true }
+lb-hashing = { workspace = true }
+lb-metrics = { workspace = true }
+tokio = { workspace = true }
+arc-swap = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+core_affinity = { workspace = true }
+
+[[bench]]
+name = "controller_bench"
+harness = false

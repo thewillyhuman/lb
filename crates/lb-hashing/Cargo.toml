@@ -1,0 +1,18 @@
+[package]
+name = "lb-hashing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lb-types = { workspace = true }
+xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+rand = { workspace = true }
+core_affinity = { workspace = true }
+
+[[bench]]
+name = "hashing_bench"
+harness = false

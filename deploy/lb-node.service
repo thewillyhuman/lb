@@ -1,0 +1,55 @@
+[Unit]
+Description=LB Node - Maglev-inspired L4 Load Balancer
+Documentation=https://github.com/thewillyhuman/lb
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Main binary
+ExecStart=/usr/local/bin/lb-node --config /etc/lb/config.toml
+
+# Config validation before start
+ExecStartPre=/usr/local/bin/lb-node --config /etc/lb/config.toml --check-config
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Resource limits
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+
+# Hugepages (needed for AF_XDP UMEM and DPDK)
+# Ensure hugepages are configured: echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+# CPU affinity — pin to specific cores to avoid interference.
+# Adjust to match your hardware. Typically:
+#   Core 0: steering thread
+#   Cores 1-N: rewriter threads
+#   Core N+1: muxer thread + controller (tokio)
+# CPUAffinity=0-8
+
+# Security hardening
+NoNewPrivileges=no
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/lb /etc/lb
+PrivateTmp=yes
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lb-node
+
+# Environment
+Environment=RUST_LOG=info
+Environment=RUST_BACKTRACE=1
+
+[Install]
+WantedBy=multi-user.target
