@@ -539,6 +539,8 @@ fn bench_thread_to_thread_mutex(c: &mut Criterion) {
                     connection_table_size: 65536,
                     connection_ttl: Duration::from_secs(60),
                     batch_size: 64,
+                    mtu_config: lb_types::MtuConfig::new(1500).unwrap(),
+                    icmp_rate_limit: 100,
                 };
 
                 // Start forwarder (includes pool allocation) BEFORE timing
@@ -594,6 +596,8 @@ fn bench_thread_to_thread_lockfree(c: &mut Criterion) {
                     connection_table_size: 65536,
                     connection_ttl: Duration::from_secs(60),
                     batch_size: 64,
+                    mtu_config: lb_types::MtuConfig::new(1500).unwrap(),
+                    icmp_rate_limit: 100,
                 };
 
                 // Start forwarder (includes pool allocation) BEFORE timing
@@ -625,6 +629,234 @@ fn bench_thread_to_thread_lockfree(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// MTU handling benchmarks
+// ---------------------------------------------------------------------------
+
+fn bench_mss_clamp_syn(c: &mut Criterion) {
+    pin_to_core();
+
+    // Build a TCP SYN with MSS=1460 (will be clamped to 1436)
+    let mut syn_template = vec![0u8; 44]; // 20 IP + 24 TCP (base 20 + MSS option 4)
+    syn_template[0] = 0x45;
+    syn_template[2..4].copy_from_slice(&44u16.to_be_bytes());
+    syn_template[8] = 64;
+    syn_template[9] = 6; // TCP
+    syn_template[12..16].copy_from_slice(&[10, 0, 0, 1]);
+    syn_template[16..20].copy_from_slice(&[188, 184, 100, 10]);
+    syn_template[20..22].copy_from_slice(&12345u16.to_be_bytes());
+    syn_template[22..24].copy_from_slice(&443u16.to_be_bytes());
+    syn_template[32] = (24 / 4) << 4; // data offset = 6 words
+    syn_template[33] = 0x02; // SYN
+    syn_template[40] = 2; // MSS kind
+    syn_template[41] = 4; // MSS len
+    syn_template[42..44].copy_from_slice(&1460u16.to_be_bytes());
+
+    c.bench_function("mss_clamp_syn_packet", |b| {
+        b.iter_batched(
+            || syn_template.clone(),
+            |mut pkt| {
+                black_box(lb_forwarder::mss_clamp::clamp_mss(&mut pkt, 1436));
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
+fn bench_mss_clamp_noop(c: &mut Criterion) {
+    pin_to_core();
+
+    // Non-SYN TCP packet — clamp_mss returns NotSyn quickly
+    let mut pkt_template = vec![0u8; 40];
+    pkt_template[0] = 0x45;
+    pkt_template[2..4].copy_from_slice(&40u16.to_be_bytes());
+    pkt_template[9] = 6; // TCP
+    pkt_template[12..16].copy_from_slice(&[10, 0, 0, 1]);
+    pkt_template[16..20].copy_from_slice(&[188, 184, 100, 10]);
+    pkt_template[32] = (20 / 4) << 4; // data offset = 5 words
+    pkt_template[33] = 0x10; // ACK (not SYN)
+
+    c.bench_function("mss_clamp_noop_not_syn", |b| {
+        b.iter_batched(
+            || pkt_template.clone(),
+            |mut pkt| {
+                black_box(lb_forwarder::mss_clamp::clamp_mss(&mut pkt, 1436));
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+}
+
+fn bench_icmp_generation(c: &mut Criterion) {
+    pin_to_core();
+
+    // Build an oversized UDP packet with DF set
+    let mut oversized = vec![0u8; 1500];
+    oversized[0] = 0x45;
+    oversized[2..4].copy_from_slice(&1500u16.to_be_bytes());
+    oversized[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+    oversized[8] = 64;
+    oversized[9] = 17; // UDP
+    oversized[12..16].copy_from_slice(&[10, 0, 0, 1]);
+    oversized[16..20].copy_from_slice(&[188, 184, 100, 10]);
+
+    let vip = Ipv4Addr::new(188, 184, 100, 10);
+
+    // Packet generation only (no rate limiter)
+    c.bench_function("icmp_frag_needed_generation", |b| {
+        b.iter(|| {
+            black_box(lb_forwarder::icmp::generate_icmp_frag_needed(
+                &oversized,
+                vip,
+                1476,
+            ));
+        })
+    });
+
+    // Full ICMP path: oversized check + rate limiter + packet generation
+    c.bench_function("icmp_full_path_allowed", |b| {
+        b.iter_batched(
+            || lb_forwarder::icmp::IcmpRateLimiter::new(u32::MAX),
+            |mut limiter| {
+                let now = Instant::now();
+                if lb_forwarder::icmp::should_generate_icmp(&oversized, 1500) {
+                    if limiter.allow(now) {
+                        black_box(lb_forwarder::icmp::generate_icmp_frag_needed(
+                            &oversized,
+                            vip,
+                            1476,
+                        ));
+                    }
+                }
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+
+    // Rate limiter: allow path (within budget)
+    c.bench_function("icmp_rate_limiter_allow", |b| {
+        let mut limiter = lb_forwarder::icmp::IcmpRateLimiter::new(u32::MAX);
+        b.iter(|| {
+            let now = Instant::now();
+            black_box(limiter.allow(now));
+        })
+    });
+
+    // Rate limiter: deny path (budget exhausted)
+    c.bench_function("icmp_rate_limiter_deny", |b| {
+        let mut limiter = lb_forwarder::icmp::IcmpRateLimiter::new(100);
+        let now = Instant::now();
+        for _ in 0..100 {
+            limiter.allow(now);
+        }
+        // Now exhausted — every call returns false
+        b.iter(|| {
+            black_box(limiter.allow(now));
+        })
+    });
+}
+
+/// Sweep MSS clamping and ICMP generation across different MTU sizes.
+fn bench_mtu_sweep(c: &mut Criterion) {
+    pin_to_core();
+
+    let vip = Ipv4Addr::new(188, 184, 100, 10);
+
+    // MSS clamp sweep: SYN packet with MSS=8960 (jumbo) clamped to each MTU's max
+    let mut group = c.benchmark_group("mtu_sweep_mss_clamp");
+    for mtu in [1280u16, 1500, 4000, 9000] {
+        let mtu_config = lb_types::MtuConfig::new(mtu).unwrap();
+
+        let mut syn = vec![0u8; 44];
+        syn[0] = 0x45;
+        syn[2..4].copy_from_slice(&44u16.to_be_bytes());
+        syn[8] = 64;
+        syn[9] = 6;
+        syn[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        syn[16..20].copy_from_slice(&[188, 184, 100, 10]);
+        syn[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        syn[22..24].copy_from_slice(&443u16.to_be_bytes());
+        syn[32] = (24 / 4) << 4;
+        syn[33] = 0x02;
+        syn[40] = 2;
+        syn[41] = 4;
+        syn[42..44].copy_from_slice(&8960u16.to_be_bytes());
+
+        group.bench_with_input(
+            BenchmarkId::new("clamp", format!("mtu_{mtu}")),
+            &mtu,
+            |b, _| {
+                b.iter_batched(
+                    || syn.clone(),
+                    |mut pkt| {
+                        black_box(lb_forwarder::mss_clamp::clamp_mss(
+                            &mut pkt,
+                            mtu_config.tcp_mss_clamp,
+                        ));
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            },
+        );
+    }
+    group.finish();
+
+    // ICMP generation sweep: oversized packet at each MTU
+    let mut group = c.benchmark_group("mtu_sweep_icmp");
+    for mtu in [1280u16, 1500, 4000, 9000] {
+        let mtu_config = lb_types::MtuConfig::new(mtu).unwrap();
+        // Packet that is exactly 1 byte over the effective inner MTU
+        let pkt_len = (mtu_config.effective_inner_mtu + 1) as usize;
+        let mut oversized = vec![0u8; pkt_len];
+        oversized[0] = 0x45;
+        oversized[2..4].copy_from_slice(&(pkt_len as u16).to_be_bytes());
+        oversized[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+        oversized[8] = 64;
+        oversized[9] = 17;
+        oversized[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        oversized[16..20].copy_from_slice(&[188, 184, 100, 10]);
+
+        group.bench_with_input(
+            BenchmarkId::new("icmp_gen", format!("mtu_{mtu}")),
+            &mtu,
+            |b, _| {
+                b.iter(|| {
+                    black_box(lb_forwarder::icmp::generate_icmp_frag_needed(
+                        &oversized,
+                        vip,
+                        mtu_config.effective_inner_mtu,
+                    ));
+                })
+            },
+        );
+    }
+    group.finish();
+
+    // should_generate_icmp check sweep
+    let mut group = c.benchmark_group("mtu_sweep_oversized_check");
+    for mtu in [1280u16, 1500, 4000, 9000] {
+        let mtu_config = lb_types::MtuConfig::new(mtu).unwrap();
+        let pkt_len = (mtu_config.effective_inner_mtu + 1) as usize;
+        let mut oversized = vec![0u8; pkt_len];
+        oversized[0] = 0x45;
+        oversized[2..4].copy_from_slice(&(pkt_len as u16).to_be_bytes());
+        oversized[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        oversized[8] = 64;
+        oversized[9] = 17;
+
+        group.bench_with_input(
+            BenchmarkId::new("check", format!("mtu_{mtu}")),
+            &mtu,
+            |b, _| {
+                b.iter(|| {
+                    black_box(lb_forwarder::icmp::should_generate_icmp(&oversized, mtu));
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_gre_encapsulate,
@@ -637,5 +869,9 @@ criterion_group!(
     bench_rewriter_to_muxer_hop,
     bench_thread_to_thread_mutex,
     bench_thread_to_thread_lockfree,
+    bench_mss_clamp_syn,
+    bench_mss_clamp_noop,
+    bench_icmp_generation,
+    bench_mtu_sweep,
 );
 criterion_main!(benches);

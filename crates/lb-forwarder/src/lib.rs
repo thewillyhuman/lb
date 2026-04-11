@@ -1,6 +1,8 @@
 pub mod conn_table;
 pub mod fragment_table;
 pub mod gre;
+pub mod icmp;
+pub mod mss_clamp;
 pub mod packet_pool;
 pub mod rewriter;
 pub mod steering;
@@ -10,7 +12,7 @@ pub mod vip_matcher;
 use lb_io::{PacketBuf, PacketIo};
 use lb_hashing::LookupTable;
 use lb_metrics::ForwarderMetrics;
-use lb_types::{BackendPoolId, HealthStatus};
+use lb_types::{BackendPoolId, HealthStatus, MtuConfig};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -28,6 +30,8 @@ pub struct ForwarderConfig {
     pub connection_table_size: usize,
     pub connection_ttl: Duration,
     pub batch_size: usize,
+    pub mtu_config: MtuConfig,
+    pub icmp_rate_limit: u32,
 }
 
 /// Single-threaded forwarder engine (multi-threading added in Iteration 6).
@@ -54,6 +58,8 @@ impl<T: PacketIo> ForwarderEngine<T> {
             vip_matcher,
             health_status,
             metrics,
+            config.mtu_config,
+            config.icmp_rate_limit,
         );
 
         Self {
@@ -143,6 +149,8 @@ mod tests {
             connection_table_size: 64,
             connection_ttl: Duration::from_secs(60),
             batch_size: 64,
+            mtu_config: MtuConfig::new(1500).unwrap(),
+            icmp_rate_limit: 100,
         };
 
         let mut engine = ForwarderEngine::new(

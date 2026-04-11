@@ -13,6 +13,13 @@ pub struct ForwarderMetrics {
     pub conn_table_misses: Counter,
     pub conn_table_size: Gauge,
     pub processing_latency_ns: Histogram,
+    // MTU handling metrics
+    pub mss_clamp_total: Counter,
+    pub mss_clamp_noop_total: Counter,
+    pub mss_clamp_missing_total: Counter,
+    pub icmp_frag_needed_sent_total: Counter,
+    pub icmp_frag_needed_ratelimited_total: Counter,
+    pub packets_oversized_dropped_total: Counter,
 }
 
 impl ForwarderMetrics {
@@ -26,6 +33,12 @@ impl ForwarderMetrics {
         let processing_latency_ns = Histogram::new(
             [100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0],
         );
+        let mss_clamp_total = Counter::default();
+        let mss_clamp_noop_total = Counter::default();
+        let mss_clamp_missing_total = Counter::default();
+        let icmp_frag_needed_sent_total = Counter::default();
+        let icmp_frag_needed_ratelimited_total = Counter::default();
+        let packets_oversized_dropped_total = Counter::default();
 
         registry.register(
             "lb_packets_received_total",
@@ -62,6 +75,36 @@ impl ForwarderMetrics {
             "Per-packet processing latency in nanoseconds",
             processing_latency_ns.clone(),
         );
+        registry.register(
+            "lb_mss_clamp_total",
+            "TCP SYN packets where MSS was clamped",
+            mss_clamp_total.clone(),
+        );
+        registry.register(
+            "lb_mss_clamp_noop_total",
+            "TCP SYN packets where MSS was already within limit",
+            mss_clamp_noop_total.clone(),
+        );
+        registry.register(
+            "lb_mss_clamp_missing_total",
+            "TCP SYN packets with no MSS option",
+            mss_clamp_missing_total.clone(),
+        );
+        registry.register(
+            "lb_icmp_frag_needed_sent_total",
+            "ICMP Fragmentation Needed responses generated",
+            icmp_frag_needed_sent_total.clone(),
+        );
+        registry.register(
+            "lb_icmp_frag_needed_ratelimited_total",
+            "ICMP responses suppressed by rate limiter",
+            icmp_frag_needed_ratelimited_total.clone(),
+        );
+        registry.register(
+            "lb_packets_oversized_dropped_total",
+            "Oversized packets dropped (DF set, exceeds inner MTU)",
+            packets_oversized_dropped_total.clone(),
+        );
 
         Self {
             packets_received,
@@ -71,6 +114,12 @@ impl ForwarderMetrics {
             conn_table_misses,
             conn_table_size,
             processing_latency_ns,
+            mss_clamp_total,
+            mss_clamp_noop_total,
+            mss_clamp_missing_total,
+            icmp_frag_needed_sent_total,
+            icmp_frag_needed_ratelimited_total,
+            packets_oversized_dropped_total,
         }
     }
 }

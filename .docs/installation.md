@@ -60,7 +60,7 @@ The resulting binary has no runtime dependencies beyond the kernel.
 # Validate the example config
 ./target/release/lb-node --config config/lb.example.toml --check-config
 
-# Run the test suite (131 tests)
+# Run the test suite (159 tests)
 cargo test --workspace
 
 # Run clippy

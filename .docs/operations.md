@@ -54,6 +54,8 @@ The LB node uses two configuration files:
 | `batch_size` | integer | `64` | Packets per batch in RX/TX |
 | `batch_flush_interval` | string | `"50us"` | Max time before flushing a partial batch |
 | `connection_ttl` | string | `"60s"` | Time before idle connections are evicted |
+| `network_mtu` | integer | `1500` | Network MTU of the data interface. Derives `effective_inner_mtu` (network_mtu - 24) and `tcp_mss_clamp` (effective_inner_mtu - 40) automatically. Must be >= 1280. |
+| `icmp_rate_limit` | integer | `100` | Maximum ICMP Fragmentation Needed responses per second. Prevents amplification from oversized non-TCP traffic bursts. Set to 0 to disable ICMP generation. |
 
 #### `[health_check_defaults]`
 
@@ -208,6 +210,12 @@ Available at `GET /metrics`. Key metrics:
 | `lb_connection_table_misses_total` | counter | Connection tracking cache misses (triggers hash lookup) |
 | `lb_connection_table_size` | gauge | Current active entries in connection table |
 | `lb_packet_processing_latency_ns` | histogram | Per-packet processing latency in nanoseconds |
+| `lb_mss_clamp_total` | counter | TCP SYN packets where MSS was clamped |
+| `lb_mss_clamp_noop_total` | counter | TCP SYN packets where MSS was already within limit |
+| `lb_mss_clamp_missing_total` | counter | TCP SYN packets with no MSS option |
+| `lb_icmp_frag_needed_sent_total` | counter | ICMP Fragmentation Needed responses generated |
+| `lb_icmp_frag_needed_ratelimited_total` | counter | ICMP responses suppressed by rate limiter |
+| `lb_packets_oversized_dropped_total` | counter | Oversized packets dropped (DF set, exceeds inner MTU) |
 
 ### Structured logging
 
@@ -294,3 +302,13 @@ When multiple backends fail simultaneously (e.g., a rack switch takes 20 servers
 - Benchmarked: 20 backends failing across 50 pools takes ~116ms with debounce vs ~2.37s without (20x improvement)
 
 No configuration is needed -- the 50ms debounce window is built-in. The window is small enough to be imperceptible to traffic (rewriter falls back to Maglev for affected flows immediately) but large enough to capture burst health events from correlated failures.
+
+### MTU misconfiguration
+
+**`network_mtu` set too high** (e.g., 9000 but the actual link is 1500): encapsulated packets exceed the real link MTU and are silently dropped by the network. TCP connections stall after the SYN (the small SYN succeeds, but the first data packet exceeds the link). Diagnose by comparing `lb_packets_forwarded_total` with backend-side `packets_received_total`. Fix: set `network_mtu` to the actual link MTU.
+
+**`network_mtu` set too low** (e.g., 1280 but the network supports 1500): MSS is clamped more aggressively than necessary, resulting in smaller TCP segments and slightly reduced throughput. No correctness issue. Self-corrects when the config is fixed.
+
+**`lb_icmp_frag_needed_ratelimited_total` increasing**: either the rate limit is too low or there is a flood of oversized non-TCP traffic. Increase `icmp_rate_limit` if the drops are affecting legitimate PMTUD convergence.
+
+**`lb_mss_clamp_total` is zero while traffic is flowing**: either there is no TCP SYN traffic (unlikely) or MSS clamping is broken. Check that `network_mtu` is set in the config and that the derived `tcp_mss_clamp` value is logged at startup.

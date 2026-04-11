@@ -70,6 +70,13 @@ pub struct ForwarderConfig {
     pub batch_flush_interval: Duration,
     #[serde(deserialize_with = "deserialize_duration")]
     pub connection_ttl: Duration,
+    /// Network MTU of the data interface. The system derives all tunnel
+    /// parameters (effective inner MTU, TCP MSS clamp) from this value.
+    #[serde(default = "default_network_mtu")]
+    pub network_mtu: u16,
+    /// Maximum ICMP Fragmentation Needed responses per second per VIP.
+    #[serde(default = "default_icmp_rate_limit")]
+    pub icmp_rate_limit: u32,
 }
 
 fn default_packet_pool_size() -> usize {
@@ -87,6 +94,12 @@ fn default_fragment_table_size() -> usize {
 }
 fn default_batch_size() -> usize {
     64
+}
+fn default_network_mtu() -> u16 {
+    1500
+}
+fn default_icmp_rate_limit() -> u32 {
+    100
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +221,8 @@ fragment_table_size = 8192
 batch_size = 64
 batch_flush_interval = "50us"
 connection_ttl = "60s"
+network_mtu = 1500
+icmp_rate_limit = 100
 
 [health_check_defaults]
 interval = "5s"

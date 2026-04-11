@@ -475,6 +475,8 @@ mod tests {
             connection_table_size: 64,
             connection_ttl: Duration::from_secs(60),
             batch_size: 64,
+            mtu_config: lb_types::MtuConfig::new(1500).unwrap(),
+            icmp_rate_limit: 100,
         };
 
         // Inject packets before starting
@@ -554,6 +556,8 @@ mod tests {
             connection_table_size: 64,
             connection_ttl: Duration::from_secs(60),
             batch_size: 64,
+            mtu_config: lb_types::MtuConfig::new(1500).unwrap(),
+            icmp_rate_limit: 100,
         };
 
         // Inject 50 packets from the SAME flow

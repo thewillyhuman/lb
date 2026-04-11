@@ -26,6 +26,8 @@ fragment_table_size    = 8192
 batch_size             = 64
 batch_flush_interval   = "50us"
 connection_ttl         = "60s"
+network_mtu            = 1500       # link MTU; derives inner MTU (1476) and TCP MSS clamp (1436)
+icmp_rate_limit        = 100        # max ICMP Frag Needed responses/sec per VIP
 
 [health_check_defaults]
 interval             = "5s"

@@ -7,6 +7,7 @@ A high-performance L4 packet-forwarding load balancer written in Rust, inspired 
 - **Maglev consistent hashing** -- minimal disruption when backends change, deterministic backend selection across all LB nodes without coordination
 - **Connection tracking** -- per-flow affinity via fixed-size Robin Hood hash table with TTL-based eviction and O(ln n) bounded probe length
 - **GRE encapsulation** -- RFC 2784 tunneling to backends, supports IPv4/IPv6 inner packets, Direct Server Return (DSR)
+- **MTU-aware tunneling** -- automatic MSS clamping on TCP SYN/SYN-ACK (incremental checksum, RFC 1624), ICMP Fragmentation Needed generation for oversized non-TCP packets with DF set, rate-limited. Operator sets `network_mtu`; all tunnel parameters derived automatically
 - **Kernel bypass I/O** -- AF_XDP and DPDK backends for line-rate packet processing on commodity hardware
 - **Multi-threaded data plane** -- steering thread distributes to per-rewriter SPSC queues; muxer thread collects TX output. Zero-copy hot path: packets live in a shared `PacketPool` arena, only 4-byte frame indices flow through queues (AF_XDP UMEM model)
 - **Health checking** -- TCP, HTTP, and HTTPS probes with configurable thresholds and state machine (UNKNOWN/HEALTHY/UNHEALTHY)
@@ -90,6 +91,31 @@ thread_to_thread_mutex_1000pkt      311 µs      (311 ns/pkt, Mutex MockIo)
 thread_to_thread_lockfree_1000pkt   521 µs      (521 ns/pkt, lock-free MockIo)
 ```
 
+**MTU handling (`lb-forwarder`)**
+
+```
+mss_clamp_syn_packet                16.9 ns     (parse TCP options + clamp MSS + incremental checksum)
+mss_clamp_noop_not_syn              14.7 ns     (early exit for non-SYN packets)
+icmp_frag_needed_generation         264 ns      (construct ICMP Type 3 Code 4 response)
+icmp_full_path_allowed              288 ns      (oversized check + rate limiter + ICMP generation)
+icmp_rate_limiter_allow             23.4 ns     (rate limiter allow path, dominated by Instant::now())
+icmp_rate_limiter_deny              3.6 ns      (rate limiter deny path, budget exhausted)
+```
+
+**MTU sweep (performance is MTU-independent)**
+
+```
+mtu_sweep_mss_clamp/clamp/mtu_1280     17.1 ns
+mtu_sweep_mss_clamp/clamp/mtu_1500     16.7 ns
+mtu_sweep_mss_clamp/clamp/mtu_4000     16.8 ns
+mtu_sweep_mss_clamp/clamp/mtu_9000     17.3 ns
+mtu_sweep_icmp/icmp_gen/mtu_1280        263.7 ns
+mtu_sweep_icmp/icmp_gen/mtu_1500        263.8 ns
+mtu_sweep_icmp/icmp_gen/mtu_4000        265.9 ns
+mtu_sweep_icmp/icmp_gen/mtu_9000        263.1 ns
+mtu_sweep_oversized_check/check/*       ~541 ps     (sub-nanosecond, two u16 comparisons)
+```
+
 **Controller debounce (`lb-controller`)**
 
 Correlated failure: N backends fail simultaneously, each in 50 pools with 15 healthy backends per pool.
@@ -161,6 +187,8 @@ During the sequential rebuild window, pools processed later still reference the 
 - **On-the-fly Maglev permutations** reduce table build memory from O(N*M) (~50MB for 100 backends) to O(N) (~1.6KB), with build time at 1.17 ms.
 - **Targeted pool rebuild** on health change: reverse index (`backend IP -> pool IDs`) avoids O(total_pools) rebuild cost, reducing a 200-pool flap from 216ms to only the affected subset.
 - **Debounce on correlated failures**: 50ms accumulation window coalesces simultaneous health changes into a single rebuild per affected pool, yielding 5-20x speedup when multiple backends fail at once (rack switch failure scenario).
+- **MSS clamping at ~17ns/SYN** adds negligible overhead to the hot path. Non-SYN packets early-exit at ~15ns. The incremental checksum update (RFC 1624) avoids full TCP checksum recomputation.
+- **ICMP generation at ~264ns** is MTU-independent (always copies the same first 28 bytes of the original packet). Rate limiter deny path is 3.6ns, so bursts of oversized traffic are cheap to suppress.
 
 ## Quick start
 
@@ -183,17 +211,19 @@ cargo build --release
 - **[Installation guide](.docs/installation.md)** -- building from source, dependencies, system preparation
 - **[Operations guide](.docs/operations.md)** -- configuration reference, deployment, monitoring, troubleshooting
 - **[Design specification](.docs/lb-spec-v2.md)** -- full architecture and protocol details
+- **[MTU handling spec](.docs/mtu-handling-spec.md)** -- MSS clamping, ICMP Frag Needed, MTU configuration
 - **[ADR-001: Configuration model](.docs/adr-001-configuration-model.md)** -- rationale for file-based configuration
 
 ## Project structure
 
 ```
 crates/
-  lb-types/           Domain model: VIP, Backend, Protocol, PacketMeta, config
+  lb-types/           Domain model: VIP, Backend, Protocol, PacketMeta, MtuConfig, config
   lb-hashing/         Maglev consistent hash: permutation, lookup table
   lb-io/              Packet I/O trait + backends: MockIo, AF_XDP, DPDK
   lb-forwarder/       Data plane: steering, rewriter, connection table,
-                      fragment table, GRE encap, packet pool, multi-threaded engine
+                      fragment table, GRE encap, MSS clamp, ICMP generation,
+                      packet pool, multi-threaded engine
   lb-metrics/         Prometheus counters, gauges, histograms
   lb-health/          Health checking: TCP, HTTP, HTTPS probes, state machine
   lb-bgp/             Minimal BGP speaker (RFC 4271)
@@ -214,7 +244,7 @@ deploy/
 ## Development
 
 ```bash
-# Run all tests (131 tests)
+# Run all tests (159 tests)
 cargo test --workspace
 
 # Run clippy
@@ -257,7 +287,7 @@ NIC RX --> [Steering] --u32 idx--> SPSC queues --u32 idx--> [Rewriter 0..N] --u3
 All packet data lives in a shared `PacketPool` (pre-allocated frame arena). Only 4-byte frame indices flow through SPSC queues -- no 2KB copies between threads.
 
 - **Steering**: RX from NIC, allocate pool frame, copy packet data in, parse 5-tuple, push frame index to rewriter queue
-- **Rewriter**: pop frame index, process frame in-place (VIP match, connection table, Maglev hash, GRE encapsulation)
+- **Rewriter**: pop frame index, process frame in-place (VIP match, MSS clamp, connection table, Maglev hash, oversized check + ICMP, GRE encapsulation)
 - **Muxer**: drain frame indices, copy to NIC TX buffer, return indices to pool (completion queue)
 
 ### Control plane (per node)
