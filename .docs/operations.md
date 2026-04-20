@@ -32,10 +32,42 @@ The LB node uses two configuration files:
 |-----|------|---------|-------------|
 | `local_asn` | integer | -- | Local BGP AS number |
 | `router_id` | string | -- | BGP router ID (typically same as `loopback_ip`) |
-| `peer_ip` | string | -- | BGP peer (upstream router) IP |
-| `peer_asn` | integer | -- | BGP peer AS number |
-| `communities` | list | `[]` | BGP community strings to attach to announcements |
+| `communities` | list | `[]` | Default BGP community strings (peers may override) |
 | `next_hop_self` | bool | `true` | Rewrite next-hop to self in BGP updates |
+| `peers` | list | -- | One entry per upstream router (see below) |
+
+##### `[[bgp.peers]]`
+
+Each entry opens an independent BGP session. Every VIP announce/withdraw
+fans out to every Established peer simultaneously. Per-peer TCP failure is
+contained: the speaker reconnects with exponential backoff (1s → 2s → ... →
+60s capped) without affecting other peers. On reconnect, the controller
+re-announces the full current VIP set to the recovered peer.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `peer_ip` | string | -- | Router IP |
+| `peer_asn` | integer | -- | Router AS number |
+| `port` | integer | `179` | TCP port for the BGP session |
+| `hold_time_secs` | integer | `90` | Hold time advertised in OPEN; keepalive interval is `hold_time / 3` |
+| `communities` | list | inherit | Per-peer community override (falls back to `[bgp].communities` when omitted) |
+| `enabled` | bool | `true` | Disable a peer without removing it from config |
+
+Legacy single-peer form (flat `peer_ip`/`peer_asn` at the top level of
+`[bgp]`) is still accepted and silently converted to a one-element `peers`
+list. It cannot be mixed with `[[bgp.peers]]` in the same file.
+
+##### BGP metrics
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `lb_bgp_state` | gauge | -- | 1 if at least one peer is Established, else 0 |
+| `lb_bgp_peer_state` | gauge | `peer_ip` | 1 = Established, 0 = Idle/Connecting/Backoff/Disabled |
+| `lb_bgp_peer_connects_total` | counter | `peer_ip` | Successful establishments |
+| `lb_bgp_peer_disconnects_total` | counter | `peer_ip` | Session disconnects (any reason) |
+| `lb_bgp_announce_failures_total` | counter | `peer_ip` | Announce failed on an Established session |
+| `lb_bgp_withdraw_failures_total` | counter | `peer_ip` | Withdraw failed on an Established session |
+| `lb_bgp_vips_announced` | gauge | -- | VIPs currently being announced |
 
 #### `[control_plane]`
 

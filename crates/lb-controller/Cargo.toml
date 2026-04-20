@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 core_affinity = { workspace = true }
+parking_lot = { workspace = true }
 
 [[bench]]
 name = "controller_bench"

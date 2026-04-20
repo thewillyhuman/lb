@@ -1,10 +1,19 @@
 use crate::messages;
-use lb_types::BgpConfig;
-use std::net::{Ipv4Addr, SocketAddr};
+use lb_types::{BgpConfig, BgpPeerConfig};
+use parking_lot::Mutex;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{self, Duration};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::{self, Duration, Instant};
+
+const DEFAULT_HOLD_TIME_SECS: u16 = 90;
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
 pub enum BgpError {
@@ -16,55 +25,279 @@ pub enum BgpError {
     Timeout,
 }
 
-/// Minimal BGP speaker for VIP announcement and withdrawal.
+/// Abstract fan-out API for VIP announcements. A test double can record
+/// announce/withdraw calls without touching real sockets.
+pub trait BgpAnnouncer: Send + Sync {
+    fn announce(&self, vips: &[Ipv4Addr]);
+    fn withdraw(&self, vips: &[Ipv4Addr]);
+}
+
+/// Observable state of a BGP peer session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerState {
+    /// Initial state before the first connect attempt.
+    Idle,
+    /// TCP connecting or OPEN handshake in progress.
+    Connecting,
+    /// Session is up; announces will be delivered.
+    Established,
+    /// Backing off after a failure. Reconnect is scheduled.
+    Backoff,
+    /// Explicitly disabled in config.
+    Disabled,
+}
+
+/// Event stream emitted by the speaker. Downstream consumers (e.g. metrics)
+/// subscribe via [`BgpSpeaker::event_rx`].
+#[derive(Debug, Clone)]
+pub enum BgpEvent {
+    PeerConnected { peer_ip: IpAddr },
+    PeerDisconnected { peer_ip: IpAddr, reason: String },
+    AnnounceFailed { peer_ip: IpAddr },
+    WithdrawFailed { peer_ip: IpAddr },
+}
+
+/// Command sent from the supervisor to a per-peer session task.
+#[derive(Debug, Clone)]
+enum SessionCmd {
+    Announce(Vec<Ipv4Addr>),
+    Withdraw(Vec<Ipv4Addr>),
+    Shutdown,
+}
+
+struct PeerHandle {
+    peer_ip: IpAddr,
+    tx: mpsc::UnboundedSender<SessionCmd>,
+    state: Arc<Mutex<PeerState>>,
+    task: Option<JoinHandle<()>>,
+    enabled: bool,
+}
+
+/// BGP supervisor: holds one session per configured peer and fans out
+/// announcements to every live peer. Per-peer failures are contained — a
+/// disconnected or backoff-waiting peer does not block announces to the rest.
 pub struct BgpSpeaker {
     config: BgpConfig,
-    stream: Option<TcpStream>,
-    keepalive_interval: Duration,
+    peers: Vec<PeerHandle>,
+    event_tx: mpsc::UnboundedSender<BgpEvent>,
+    event_rx: Option<mpsc::UnboundedReceiver<BgpEvent>>,
 }
 
 impl BgpSpeaker {
     pub fn new(config: BgpConfig) -> Self {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         Self {
             config,
-            stream: None,
-            keepalive_interval: Duration::from_secs(30),
+            peers: Vec::new(),
+            event_tx,
+            event_rx: Some(event_rx),
         }
     }
 
-    /// Connect to the BGP peer and complete the OPEN handshake.
-    pub async fn connect(&mut self) -> Result<(), BgpError> {
-        let peer_addr = SocketAddr::new(self.config.peer_ip, 179);
+    /// Take the event receiver exactly once. Returns `None` on subsequent calls.
+    pub fn take_event_rx(&mut self) -> Option<mpsc::UnboundedReceiver<BgpEvent>> {
+        self.event_rx.take()
+    }
 
-        let stream = time::timeout(Duration::from_secs(10), TcpStream::connect(peer_addr))
+    /// Spawn one tokio task per configured peer. Must be called on an active
+    /// tokio runtime. Idempotent: calling twice is a programming error.
+    pub fn spawn(&mut self, rt: &tokio::runtime::Handle) {
+        assert!(self.peers.is_empty(), "BgpSpeaker::spawn called twice");
+
+        let router_id = match self.config.router_id {
+            IpAddr::V4(v4) => v4,
+            _ => {
+                tracing::error!("router_id must be IPv4; no BGP sessions will start");
+                return;
+            }
+        };
+
+        for peer_cfg in &self.config.peers {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let state = Arc::new(Mutex::new(if peer_cfg.enabled {
+                PeerState::Idle
+            } else {
+                PeerState::Disabled
+            }));
+
+            let handle = if peer_cfg.enabled {
+                let session = PeerSessionCtx {
+                    peer: peer_cfg.clone(),
+                    local_asn: self.config.local_asn as u16,
+                    router_id,
+                    state: Arc::clone(&state),
+                    events: self.event_tx.clone(),
+                };
+                Some(rt.spawn(session.run(rx)))
+            } else {
+                // Drain any commands received for a disabled peer.
+                Some(rt.spawn(async move {
+                    let mut rx = rx;
+                    while let Some(cmd) = rx.recv().await {
+                        if matches!(cmd, SessionCmd::Shutdown) {
+                            break;
+                        }
+                    }
+                }))
+            };
+
+            self.peers.push(PeerHandle {
+                peer_ip: peer_cfg.peer_ip,
+                tx,
+                state,
+                task: handle,
+                enabled: peer_cfg.enabled,
+            });
+        }
+    }
+
+    /// Current state of every configured peer (alive or not).
+    pub fn peer_states(&self) -> Vec<(IpAddr, PeerState)> {
+        self.peers
+            .iter()
+            .map(|p| (p.peer_ip, *p.state.lock()))
+            .collect()
+    }
+
+    /// Graceful shutdown: signal every peer session to terminate, then await.
+    pub async fn shutdown(&mut self) {
+        for peer in &self.peers {
+            let _ = peer.tx.send(SessionCmd::Shutdown);
+        }
+        for peer in self.peers.iter_mut() {
+            if let Some(task) = peer.task.take() {
+                let _ = task.await;
+            }
+        }
+    }
+}
+
+impl BgpAnnouncer for BgpSpeaker {
+    fn announce(&self, vips: &[Ipv4Addr]) {
+        if vips.is_empty() {
+            return;
+        }
+        for peer in &self.peers {
+            if !peer.enabled {
+                continue;
+            }
+            // UnboundedSender::send only fails if the receiver is closed,
+            // which means the peer task panicked or already exited — log and
+            // move on; do not poison other peers.
+            if peer.tx.send(SessionCmd::Announce(vips.to_vec())).is_err() {
+                tracing::warn!(peer = %peer.peer_ip, "announce dropped: session channel closed");
+            }
+        }
+    }
+
+    fn withdraw(&self, vips: &[Ipv4Addr]) {
+        if vips.is_empty() {
+            return;
+        }
+        for peer in &self.peers {
+            if !peer.enabled {
+                continue;
+            }
+            if peer.tx.send(SessionCmd::Withdraw(vips.to_vec())).is_err() {
+                tracing::warn!(peer = %peer.peer_ip, "withdraw dropped: session channel closed");
+            }
+        }
+    }
+}
+
+struct PeerSessionCtx {
+    peer: BgpPeerConfig,
+    local_asn: u16,
+    router_id: Ipv4Addr,
+    state: Arc<Mutex<PeerState>>,
+    events: mpsc::UnboundedSender<BgpEvent>,
+}
+
+impl PeerSessionCtx {
+    fn set_state(&self, new: PeerState) {
+        *self.state.lock() = new;
+    }
+
+    async fn run(self, mut rx: mpsc::UnboundedReceiver<SessionCmd>) {
+        let mut backoff = RECONNECT_BACKOFF_MIN;
+        let hold_time = self
+            .peer
+            .hold_time_secs
+            .unwrap_or(DEFAULT_HOLD_TIME_SECS);
+        let keepalive_interval = Duration::from_secs((hold_time / 3).max(1) as u64);
+
+        loop {
+            // Drain any queued commands: a shutdown should win over a reconnect
+            // attempt. Peek via try_recv on a best-effort basis.
+            while let Ok(cmd) = rx.try_recv() {
+                if matches!(cmd, SessionCmd::Shutdown) {
+                    self.set_state(PeerState::Idle);
+                    return;
+                }
+                // Drop announce/withdraw that arrived while we were not
+                // connected; the supervisor will re-announce from the
+                // controller's fresh VIP set on reconnect. (The controller's
+                // current-state snapshot is re-announced by the caller when
+                // `PeerConnected` is observed — see wiring in lb-controller.)
+            }
+
+            self.set_state(PeerState::Connecting);
+            match self.connect(hold_time).await {
+                Ok(stream) => {
+                    backoff = RECONNECT_BACKOFF_MIN;
+                    self.set_state(PeerState::Established);
+                    let _ = self.events.send(BgpEvent::PeerConnected {
+                        peer_ip: self.peer.peer_ip,
+                    });
+
+                    let shutdown = self.drive(stream, &mut rx, keepalive_interval).await;
+                    let _ = self.events.send(BgpEvent::PeerDisconnected {
+                        peer_ip: self.peer.peer_ip,
+                        reason: shutdown.reason.clone(),
+                    });
+
+                    if shutdown.terminal {
+                        self.set_state(PeerState::Idle);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %self.peer.peer_ip, error = %e, "BGP connect failed");
+                }
+            }
+
+            self.set_state(PeerState::Backoff);
+            let sleep = tokio::time::sleep(backoff);
+            tokio::pin!(sleep);
+            tokio::select! {
+                _ = &mut sleep => {}
+                cmd = rx.recv() => {
+                    if matches!(cmd, Some(SessionCmd::Shutdown) | None) {
+                        self.set_state(PeerState::Idle);
+                        return;
+                    }
+                }
+            }
+            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+        }
+    }
+
+    async fn connect(&self, hold_time: u16) -> Result<TcpStream, BgpError> {
+        let peer_addr = SocketAddr::new(self.peer.peer_ip, self.peer.port);
+
+        let mut stream = time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer_addr))
             .await
             .map_err(|_| BgpError::Timeout)?
             .map_err(BgpError::Io)?;
 
-        let router_id = match self.config.router_id {
-            std::net::IpAddr::V4(v4) => v4,
-            _ => return Err(BgpError::Session("router_id must be IPv4".into())),
-        };
+        let open = messages::encode_open(self.local_asn, hold_time, self.router_id);
+        stream.write_all(&open).await?;
 
-        let open_msg = messages::encode_open(
-            self.config.local_asn as u16,
-            90,
-            router_id,
-        );
-
-        self.stream = Some(stream);
-        let stream = self.stream.as_mut().unwrap();
-
-        // Send OPEN
-        stream.write_all(&open_msg).await?;
-
-        // Read peer's OPEN
         let mut buf = vec![0u8; 4096];
         let n = stream.read(&mut buf).await?;
         if n < 19 {
             return Err(BgpError::Session("incomplete BGP message from peer".into()));
         }
-
         match messages::parse_message_type(&buf[..n]) {
             Some(messages::BgpMessageType::Open) => {}
             other => {
@@ -74,74 +307,113 @@ impl BgpSpeaker {
             }
         }
 
-        // Send KEEPALIVE to confirm the session
         let keepalive = messages::encode_keepalive();
         stream.write_all(&keepalive).await?;
 
         tracing::info!(peer = %peer_addr, "BGP session established");
-        Ok(())
+        Ok(stream)
     }
 
-    /// Announce VIP prefixes to the BGP peer.
-    pub async fn announce(&mut self, vips: &[Ipv4Addr]) -> Result<(), BgpError> {
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| BgpError::Session("not connected".into()))?;
+    /// Pump commands + keepalives until the session dies or shutdown arrives.
+    async fn drive(
+        &self,
+        mut stream: TcpStream,
+        rx: &mut mpsc::UnboundedReceiver<SessionCmd>,
+        keepalive_interval: Duration,
+    ) -> Disconnect {
+        let mut ticker = time::interval_at(Instant::now() + keepalive_interval, keepalive_interval);
+        let mut read_buf = [0u8; 64];
 
-        let next_hop = match self.config.router_id {
-            std::net::IpAddr::V4(v4) => v4,
-            _ => return Err(BgpError::Session("router_id must be IPv4".into())),
-        };
-
-        for &vip in vips {
-            let update = messages::encode_update_announce(
-                vip,
-                32, // /32 host route
-                next_hop,
-                self.config.local_asn as u16,
-            );
-            stream.write_all(&update).await?;
-            tracing::info!(vip = %vip, "announced VIP");
-        }
-
-        Ok(())
-    }
-
-    /// Withdraw VIP prefixes from the BGP peer.
-    pub async fn withdraw(&mut self, vips: &[Ipv4Addr]) -> Result<(), BgpError> {
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| BgpError::Session("not connected".into()))?;
-
-        for &vip in vips {
-            let update = messages::encode_update_withdraw(vip, 32);
-            stream.write_all(&update).await?;
-            tracing::info!(vip = %vip, "withdrew VIP");
-        }
-
-        Ok(())
-    }
-
-    /// Send a keepalive message.
-    pub async fn send_keepalive(&mut self) -> Result<(), BgpError> {
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| BgpError::Session("not connected".into()))?;
-
-        let msg = messages::encode_keepalive();
-        stream.write_all(&msg).await?;
-        Ok(())
-    }
-
-    /// Run the keepalive loop. Should be spawned as a background task.
-    pub async fn keepalive_loop(&mut self) -> Result<(), BgpError> {
-        let mut ticker = time::interval(self.keepalive_interval);
         loop {
-            ticker.tick().await;
-            self.send_keepalive().await?;
+            tokio::select! {
+                cmd = rx.recv() => {
+                    let Some(cmd) = cmd else {
+                        return Disconnect::terminal("supervisor dropped");
+                    };
+                    match cmd {
+                        SessionCmd::Shutdown => return Disconnect::terminal("shutdown"),
+                        SessionCmd::Announce(vips) => {
+                            if let Err(e) = self.send_announce(&mut stream, &vips).await {
+                                let _ = self.events.send(BgpEvent::AnnounceFailed {
+                                    peer_ip: self.peer.peer_ip,
+                                });
+                                return Disconnect::transient(format!("announce: {e}"));
+                            }
+                        }
+                        SessionCmd::Withdraw(vips) => {
+                            if let Err(e) = self.send_withdraw(&mut stream, &vips).await {
+                                let _ = self.events.send(BgpEvent::WithdrawFailed {
+                                    peer_ip: self.peer.peer_ip,
+                                });
+                                return Disconnect::transient(format!("withdraw: {e}"));
+                            }
+                        }
+                    }
+                }
+                _ = ticker.tick() => {
+                    let msg = messages::encode_keepalive();
+                    if let Err(e) = stream.write_all(&msg).await {
+                        return Disconnect::transient(format!("keepalive: {e}"));
+                    }
+                }
+                read = stream.read(&mut read_buf) => {
+                    match read {
+                        Ok(0) => return Disconnect::transient("peer closed connection".into()),
+                        Ok(_) => {
+                            // We accept and ignore peer-initiated messages
+                            // (KEEPALIVE, UPDATE, NOTIFICATION). A strict
+                            // parser is out of scope for the current speaker.
+                        }
+                        Err(e) => return Disconnect::transient(format!("read: {e}")),
+                    }
+                }
+            }
+        }
+    }
+
+    async fn send_announce(
+        &self,
+        stream: &mut TcpStream,
+        vips: &[Ipv4Addr],
+    ) -> Result<(), BgpError> {
+        for &vip in vips {
+            let msg = messages::encode_update_announce(vip, 32, self.router_id, self.local_asn);
+            stream.write_all(&msg).await?;
+            tracing::debug!(peer = %self.peer.peer_ip, vip = %vip, "announced VIP");
+        }
+        Ok(())
+    }
+
+    async fn send_withdraw(
+        &self,
+        stream: &mut TcpStream,
+        vips: &[Ipv4Addr],
+    ) -> Result<(), BgpError> {
+        for &vip in vips {
+            let msg = messages::encode_update_withdraw(vip, 32);
+            stream.write_all(&msg).await?;
+            tracing::debug!(peer = %self.peer.peer_ip, vip = %vip, "withdrew VIP");
+        }
+        Ok(())
+    }
+}
+
+struct Disconnect {
+    reason: String,
+    terminal: bool,
+}
+
+impl Disconnect {
+    fn terminal(reason: &str) -> Self {
+        Self {
+            reason: reason.into(),
+            terminal: true,
+        }
+    }
+    fn transient(reason: String) -> Self {
+        Self {
+            reason,
+            terminal: false,
         }
     }
 }
@@ -151,71 +423,308 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
-    fn test_config(_peer_port: u16) -> BgpConfig {
+    fn config_for(ports: &[u16]) -> BgpConfig {
         BgpConfig {
             local_asn: 65000,
-            router_id: std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            peer_ip: std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
-            peer_asn: 65000,
+            router_id: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             communities: vec![],
             next_hop_self: true,
+            peers: ports
+                .iter()
+                .map(|&p| BgpPeerConfig {
+                    peer_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    peer_asn: 65000,
+                    port: p,
+                    hold_time_secs: Some(9),
+                    communities: None,
+                    enabled: true,
+                })
+                .collect(),
         }
     }
 
-    #[tokio::test]
-    async fn connect_and_handshake() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        // Mock BGP peer
-        let peer = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-
-            // Read OPEN from speaker
-            let n = stream.read(&mut buf).await.unwrap();
-            assert!(n >= 29); // OPEN is 29 bytes
-            assert_eq!(
-                messages::parse_message_type(&buf[..n]),
-                Some(messages::BgpMessageType::Open)
-            );
-
-            // Send OPEN back
-            let open = messages::encode_open(65000, 90, Ipv4Addr::new(10, 0, 0, 254));
-            stream.write_all(&open).await.unwrap();
-
-            // Read KEEPALIVE
-            let n = stream.read(&mut buf).await.unwrap();
-            assert_eq!(
-                messages::parse_message_type(&buf[..n]),
-                Some(messages::BgpMessageType::Keepalive)
-            );
-        });
-
-        let mut config = test_config(port);
-        config.peer_ip = std::net::IpAddr::V4(Ipv4Addr::LOCALHOST);
-
-        // Override the port (BGP uses 179 but we use a random port for testing)
-        // We need to connect to the listener's port, not 179
-        let mut speaker = BgpSpeaker::new(config);
-        // Patch: connect manually to the test port
-        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
-            .await
-            .unwrap();
-        speaker.stream = Some(stream);
-
-        let router_id = Ipv4Addr::new(10, 0, 0, 1);
-        let open_msg = messages::encode_open(65000, 90, router_id);
-        speaker.stream.as_mut().unwrap().write_all(&open_msg).await.unwrap();
-
+    /// Accept one BGP handshake and record every subsequent UPDATE body.
+    /// Returns all bytes read after the handshake. Stops reading when either
+    /// the stop signal arrives or the peer closes the connection.
+    async fn mock_peer(
+        listener: TcpListener,
+        mut stop: oneshot::Receiver<()>,
+    ) -> Vec<u8> {
+        let (mut stream, _) = listener.accept().await.unwrap();
         let mut buf = vec![0u8; 4096];
-        let n = speaker.stream.as_mut().unwrap().read(&mut buf).await.unwrap();
+
+        // Read OPEN
+        let n = stream.read(&mut buf).await.unwrap();
         assert!(n >= 19);
+        assert_eq!(
+            messages::parse_message_type(&buf[..n]),
+            Some(messages::BgpMessageType::Open)
+        );
 
-        let keepalive = messages::encode_keepalive();
-        speaker.stream.as_mut().unwrap().write_all(&keepalive).await.unwrap();
+        // Reply with OPEN + KEEPALIVE
+        let open = messages::encode_open(65000, 90, Ipv4Addr::new(10, 0, 0, 254));
+        stream.write_all(&open).await.unwrap();
+        let ka = messages::encode_keepalive();
+        stream.write_all(&ka).await.unwrap();
 
-        peer.await.unwrap();
+        // Read speaker's KEEPALIVE
+        let _ = stream.read(&mut buf).await.unwrap();
+
+        // Accumulate everything the speaker sends until stop arrives or the
+        // peer closes. Keep captured data across the stop — the caller needs
+        // to inspect it.
+        let mut captured = Vec::new();
+        let mut tmp = vec![0u8; 4096];
+        loop {
+            tokio::select! {
+                r = stream.read(&mut tmp) => {
+                    match r {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => captured.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                _ = &mut stop => break,
+            }
+        }
+        captured
+    }
+
+    #[tokio::test]
+    async fn two_peers_handshake_independently() {
+        let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pa = a.local_addr().unwrap().port();
+        let pb = b.local_addr().unwrap().port();
+
+        let (stop_a_tx, stop_a_rx) = oneshot::channel();
+        let (stop_b_tx, stop_b_rx) = oneshot::channel();
+        let h_a = tokio::spawn(mock_peer(a, stop_a_rx));
+        let h_b = tokio::spawn(mock_peer(b, stop_b_rx));
+
+        let mut speaker = BgpSpeaker::new(config_for(&[pa, pb]));
+        speaker.spawn(&tokio::runtime::Handle::current());
+
+        wait_for_state(&speaker, PeerState::Established, 2, Duration::from_secs(2)).await;
+
+        let _ = stop_a_tx.send(());
+        let _ = stop_b_tx.send(());
+        speaker.shutdown().await;
+        let _ = h_a.await.unwrap();
+        let _ = h_b.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn announce_fans_out_to_all_peers() {
+        let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pa = a.local_addr().unwrap().port();
+        let pb = b.local_addr().unwrap().port();
+
+        let (stop_a_tx, stop_a_rx) = oneshot::channel();
+        let (stop_b_tx, stop_b_rx) = oneshot::channel();
+        let h_a = tokio::spawn(mock_peer(a, stop_a_rx));
+        let h_b = tokio::spawn(mock_peer(b, stop_b_rx));
+
+        let mut speaker = BgpSpeaker::new(config_for(&[pa, pb]));
+        speaker.spawn(&tokio::runtime::Handle::current());
+
+        wait_for_state(&speaker, PeerState::Established, 2, Duration::from_secs(2)).await;
+
+        let vip = Ipv4Addr::new(188, 184, 100, 10);
+        speaker.announce(&[vip]);
+
+        // Let both sessions flush the write.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let _ = stop_a_tx.send(());
+        let _ = stop_b_tx.send(());
+        speaker.shutdown().await;
+
+        let captured_a = h_a.await.unwrap();
+        let captured_b = h_b.await.unwrap();
+
+        assert!(contains_update_with_nlri(&captured_a, vip), "peer A missed UPDATE: {captured_a:?}");
+        assert!(contains_update_with_nlri(&captured_b, vip), "peer B missed UPDATE: {captured_b:?}");
+    }
+
+    #[tokio::test]
+    async fn one_peer_down_does_not_block_others() {
+        // Peer A never listens; peer B listens normally.
+        let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pb = b.local_addr().unwrap().port();
+        // Port 1 is guaranteed to refuse on 127.0.0.1.
+        let pa_dead = 1u16;
+
+        let (stop_b_tx, stop_b_rx) = oneshot::channel();
+        let h_b = tokio::spawn(mock_peer(b, stop_b_rx));
+
+        let mut speaker = BgpSpeaker::new(config_for(&[pa_dead, pb]));
+        speaker.spawn(&tokio::runtime::Handle::current());
+
+        // Wait for *one* peer to be Established (peer B). Peer A will stay in
+        // Connecting/Backoff indefinitely.
+        wait_for_state(&speaker, PeerState::Established, 1, Duration::from_secs(3)).await;
+
+        let vip = Ipv4Addr::new(10, 1, 2, 3);
+        speaker.announce(&[vip]);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let _ = stop_b_tx.send(());
+        speaker.shutdown().await;
+
+        let captured_b = h_b.await.unwrap();
+        assert!(contains_update_with_nlri(&captured_b, vip), "peer B missed UPDATE despite peer A being down");
+    }
+
+    #[tokio::test]
+    async fn withdraw_fans_out() {
+        let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pa = a.local_addr().unwrap().port();
+        let pb = b.local_addr().unwrap().port();
+
+        let (stop_a_tx, stop_a_rx) = oneshot::channel();
+        let (stop_b_tx, stop_b_rx) = oneshot::channel();
+        let h_a = tokio::spawn(mock_peer(a, stop_a_rx));
+        let h_b = tokio::spawn(mock_peer(b, stop_b_rx));
+
+        let mut speaker = BgpSpeaker::new(config_for(&[pa, pb]));
+        speaker.spawn(&tokio::runtime::Handle::current());
+        wait_for_state(&speaker, PeerState::Established, 2, Duration::from_secs(2)).await;
+
+        let vip = Ipv4Addr::new(1, 2, 3, 4);
+        speaker.withdraw(&[vip]);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let _ = stop_a_tx.send(());
+        let _ = stop_b_tx.send(());
+        speaker.shutdown().await;
+
+        let captured_a = h_a.await.unwrap();
+        let captured_b = h_b.await.unwrap();
+        assert!(contains_update_with_withdrawn(&captured_a, vip));
+        assert!(contains_update_with_withdrawn(&captured_b, vip));
+    }
+
+    #[tokio::test]
+    async fn disabled_peer_does_not_connect() {
+        let mut cfg = config_for(&[9]); // port 9 unused in any case
+        cfg.peers[0].enabled = false;
+
+        let mut speaker = BgpSpeaker::new(cfg);
+        speaker.spawn(&tokio::runtime::Handle::current());
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let states = speaker.peer_states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].1, PeerState::Disabled);
+
+        speaker.announce(&[Ipv4Addr::new(1, 2, 3, 4)]); // must be a no-op
+        speaker.shutdown().await;
+    }
+
+    async fn wait_for_state(
+        speaker: &BgpSpeaker,
+        target: PeerState,
+        need_count: usize,
+        budget: Duration,
+    ) {
+        let deadline = Instant::now() + budget;
+        loop {
+            let matches = speaker
+                .peer_states()
+                .into_iter()
+                .filter(|(_, s)| *s == target)
+                .count();
+            if matches >= need_count {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "timed out waiting for {need_count} peers in {target:?}; observed {:?}",
+                    speaker.peer_states()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Scan `data` for an UPDATE containing the given /32 in its NLRI.
+    fn contains_update_with_nlri(data: &[u8], vip: Ipv4Addr) -> bool {
+        scan_for_prefix(data, vip, /*is_withdraw*/ false)
+    }
+
+    fn contains_update_with_withdrawn(data: &[u8], vip: Ipv4Addr) -> bool {
+        scan_for_prefix(data, vip, /*is_withdraw*/ true)
+    }
+
+    fn scan_for_prefix(data: &[u8], vip: Ipv4Addr, withdraw: bool) -> bool {
+        // Walk BGP messages in `data`.
+        let mut i = 0;
+        while i + 19 <= data.len() {
+            // Marker check
+            if data[i..i + 16] != [0xFF; 16] {
+                i += 1;
+                continue;
+            }
+            let len = u16::from_be_bytes([data[i + 16], data[i + 17]]) as usize;
+            if len < 19 || i + len > data.len() {
+                break;
+            }
+            let ty = data[i + 18];
+            if ty == 2 {
+                // UPDATE. Body at i+19.
+                let body = &data[i + 19..i + len];
+                if let Some(pos) = find_prefix(body, vip, withdraw) {
+                    let _ = pos;
+                    return true;
+                }
+            }
+            i += len;
+        }
+        false
+    }
+
+    fn find_prefix(body: &[u8], vip: Ipv4Addr, withdraw: bool) -> Option<usize> {
+        if body.len() < 2 {
+            return None;
+        }
+        let wlen = u16::from_be_bytes([body[0], body[1]]) as usize;
+        if body.len() < 2 + wlen {
+            return None;
+        }
+        let withdrawn = &body[2..2 + wlen];
+
+        if body.len() < 2 + wlen + 2 {
+            return None;
+        }
+        let palen_start = 2 + wlen;
+        let palen = u16::from_be_bytes([body[palen_start], body[palen_start + 1]]) as usize;
+        let nlri_start = palen_start + 2 + palen;
+        if body.len() < nlri_start {
+            return None;
+        }
+        let nlri = &body[nlri_start..];
+
+        let target = if withdraw { withdrawn } else { nlri };
+        // Each prefix: 1 byte prefix_len + ceil(len/8) bytes.
+        let mut j = 0;
+        while j < target.len() {
+            let plen = target[j] as usize;
+            let pbytes = plen.div_ceil(8);
+            if j + 1 + pbytes > target.len() {
+                return None;
+            }
+            if plen == 32 {
+                let oct = &target[j + 1..j + 1 + pbytes];
+                if oct == vip.octets() {
+                    return Some(j);
+                }
+            }
+            j += 1 + pbytes;
+        }
+        None
     }
 }

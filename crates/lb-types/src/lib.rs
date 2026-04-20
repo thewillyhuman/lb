@@ -7,7 +7,7 @@ pub mod vip;
 
 pub use backend::{Backend, BackendPool, BackendPoolId, HealthStatus};
 pub use config::{
-    BgpConfig, ControlPlaneConfig, ForwarderConfig, HealthCheckConfig, NodeConfig,
+    BgpConfig, BgpPeerConfig, ControlPlaneConfig, ForwarderConfig, HealthCheckConfig, NodeConfig,
 };
 pub use error::LbError;
 pub use mtu::MtuConfig;
