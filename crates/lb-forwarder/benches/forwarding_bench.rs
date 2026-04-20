@@ -9,7 +9,7 @@ use lb_hashing::LookupTable;
 use lb_io::mock::{mock_io, mock_io_lockfree};
 use lb_io::PacketBuf;
 use lb_metrics::ForwarderMetrics;
-use lb_types::{Backend, BackendPoolId, PacketMeta, Protocol};
+use lb_types::{Backend, BackendPoolId, ConnTtls, FlowProto, PacketMeta, Protocol, TcpFlowState};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -98,11 +98,13 @@ fn bench_gre_encapsulate(c: &mut Criterion) {
 fn bench_conn_table_lookup(c: &mut Criterion) {
     pin_to_core();
     let now = Instant::now();
-    let mut table = ConnTable::new(65536, Duration::from_secs(60));
+    let mut table = ConnTable::new(65536, ConnTtls::with_established(Duration::from_secs(60)));
     for i in 0..10000u64 {
         table.insert(
             i * 7 + 13,
             IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+            FlowProto::Tcp,
+            TcpFlowState::Established,
             now,
         );
     }
@@ -127,11 +129,13 @@ fn bench_conn_table_high_fill(c: &mut Criterion) {
         let (insert_keys, lookup_keys) = skewed_keys(capacity, fill_pct);
 
         let now = Instant::now();
-        let mut table = ConnTable::new(capacity, Duration::from_secs(60));
+        let mut table = ConnTable::new(capacity, ConnTtls::with_established(Duration::from_secs(60)));
         for (i, &key) in insert_keys.iter().enumerate() {
             table.insert(
                 key,
                 IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+                FlowProto::Tcp,
+                TcpFlowState::Established,
                 now,
             );
         }
@@ -205,19 +209,20 @@ fn bench_full_pipeline(c: &mut Criterion) {
 
     c.bench_function("full_pipeline_per_packet", |b| {
         b.iter(|| {
-            let mut conn_table = ConnTable::new(65536, Duration::from_secs(60));
+            let mut conn_table = ConnTable::new(65536, ConnTtls::with_established(Duration::from_secs(60)));
             let now = Instant::now();
 
             for pkt in &packets {
                 let meta = PacketMeta::from_ipv4_bytes(pkt.as_slice()).unwrap();
                 let matched_pool = vip_matcher.match_packet(meta.dst_ip, meta.protocol, meta.dst_port).unwrap();
                 let flow_hash = meta.flow_hash();
+                let proto = FlowProto::from(meta.protocol);
                 let backend_ip = if let Some(cached) = conn_table.get(flow_hash, now) {
                     cached
                 } else {
                     let lt = tables.get(matched_pool).unwrap().load();
                     let backend = lt.lookup(flow_hash);
-                    conn_table.insert(flow_hash, backend.ip, now);
+                    conn_table.insert(flow_hash, backend.ip, proto, TcpFlowState::Handshake, now);
                     backend.ip
                 };
 
@@ -228,6 +233,87 @@ fn bench_full_pipeline(c: &mut Criterion) {
 
                 let mut out = pkt.clone();
                 black_box(gre::encapsulate_ipv4(&mut out, src_ip, dst_ip));
+            }
+        })
+    });
+}
+
+// ---------------------------------------------------------------------------
+// TCP state transitions and mixed-protocol fill (Commit B additions)
+// ---------------------------------------------------------------------------
+
+fn bench_conn_table_tcp_transitions(c: &mut Criterion) {
+    pin_to_core();
+    let now = Instant::now();
+    let mut table = ConnTable::new(
+        65536,
+        ConnTtls::with_established(Duration::from_secs(60)),
+    );
+    // Pre-populate with Established entries so every transition targets a
+    // real slot — reflects the steady-state cost in production.
+    for i in 0..10_000u64 {
+        table.insert(
+            i * 7 + 13,
+            IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+            FlowProto::Tcp,
+            TcpFlowState::Established,
+            now,
+        );
+    }
+    let hashes: Vec<u64> = (0..10_000u64).map(|i| i * 7 + 13).collect();
+
+    c.bench_function("conn_table_mark_established_10k", |b| {
+        b.iter(|| {
+            let now = Instant::now();
+            for &h in &hashes {
+                table.mark_established(black_box(h), now);
+            }
+        })
+    });
+
+    c.bench_function("conn_table_mark_closing_10k", |b| {
+        b.iter(|| {
+            let now = Instant::now();
+            for &h in &hashes {
+                table.mark_closing(black_box(h), now);
+            }
+        })
+    });
+}
+
+fn bench_conn_table_mixed_protocol(c: &mut Criterion) {
+    pin_to_core();
+    let now = Instant::now();
+    let capacity: usize = 65536;
+    let fill = capacity * 70 / 100;
+
+    let mut table = ConnTable::new(capacity, ConnTtls::with_established(Duration::from_secs(60)));
+    for i in 0..fill as u64 {
+        let proto = match i % 3 {
+            0 => FlowProto::Tcp,
+            1 => FlowProto::Udp,
+            _ => FlowProto::Other,
+        };
+        let state = if proto == FlowProto::Tcp {
+            TcpFlowState::Established
+        } else {
+            TcpFlowState::NotTcp
+        };
+        table.insert(
+            i * 31 + 7,
+            IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+            proto,
+            state,
+            now,
+        );
+    }
+    let hashes: Vec<u64> = (0..10_000u64).map(|i| i * 31 + 7).collect();
+
+    c.bench_function("conn_table_mixed_protocol_70pct_fill", |b| {
+        b.iter(|| {
+            let now = Instant::now();
+            for &h in &hashes {
+                black_box(table.get(h, now));
             }
         })
     });
@@ -537,7 +623,7 @@ fn bench_thread_to_thread_mutex(c: &mut Criterion) {
                 let config = ForwarderConfig {
                     src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
                     connection_table_size: 65536,
-                    connection_ttl: Duration::from_secs(60),
+                    conn_ttls: ConnTtls::with_established(Duration::from_secs(60)),
                     batch_size: 64,
                     mtu_config: lb_types::MtuConfig::new(1500).unwrap(),
                     icmp_rate_limit: 100,
@@ -594,7 +680,7 @@ fn bench_thread_to_thread_lockfree(c: &mut Criterion) {
                 let config = ForwarderConfig {
                     src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
                     connection_table_size: 65536,
-                    connection_ttl: Duration::from_secs(60),
+                    conn_ttls: ConnTtls::with_established(Duration::from_secs(60)),
                     batch_size: 64,
                     mtu_config: lb_types::MtuConfig::new(1500).unwrap(),
                     icmp_rate_limit: 100,
@@ -719,14 +805,14 @@ fn bench_icmp_generation(c: &mut Criterion) {
             || lb_forwarder::icmp::IcmpRateLimiter::new(u32::MAX),
             |mut limiter| {
                 let now = Instant::now();
-                if lb_forwarder::icmp::should_generate_icmp(&oversized, 1500) {
-                    if limiter.allow(now) {
-                        black_box(lb_forwarder::icmp::generate_icmp_frag_needed(
-                            &oversized,
-                            vip,
-                            1476,
-                        ));
-                    }
+                if lb_forwarder::icmp::should_generate_icmp(&oversized, 1500)
+                    && limiter.allow(now)
+                {
+                    black_box(lb_forwarder::icmp::generate_icmp_frag_needed(
+                        &oversized,
+                        vip,
+                        1476,
+                    ));
                 }
             },
             criterion::BatchSize::SmallInput,
@@ -862,6 +948,8 @@ criterion_group!(
     bench_gre_encapsulate,
     bench_conn_table_lookup,
     bench_conn_table_high_fill,
+    bench_conn_table_tcp_transitions,
+    bench_conn_table_mixed_protocol,
     bench_full_pipeline,
     bench_spsc_descriptor,
     bench_spsc_raw,

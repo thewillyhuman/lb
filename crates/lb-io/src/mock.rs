@@ -186,8 +186,8 @@ mod tests {
         let n = io.recv_batch(&mut buf).unwrap();
         assert_eq!(n, 10);
 
-        for i in 0..10 {
-            assert_eq!(buf[i].as_slice(), &[i as u8; 64]);
+        for (i, entry) in buf.iter().enumerate().take(10) {
+            assert_eq!(entry.as_slice(), &[i as u8; 64]);
         }
     }
 

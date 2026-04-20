@@ -85,9 +85,39 @@ list. It cannot be mixed with `[[bgp.peers]]` in the same file.
 | `fragment_table_size` | integer | `8192` | Fragment reassembly table entries |
 | `batch_size` | integer | `64` | Packets per batch in RX/TX |
 | `batch_flush_interval` | string | `"50us"` | Max time before flushing a partial batch |
-| `connection_ttl` | string | `"60s"` | Time before idle connections are evicted |
+| `connection_ttl` | string | `"60s"` | Legacy single TTL. Used as the default for `connection_ttls.tcp_established` when the section below is absent |
 | `network_mtu` | integer | `1500` | Network MTU of the data interface. Derives `effective_inner_mtu` (network_mtu - 24) and `tcp_mss_clamp` (effective_inner_mtu - 40) automatically. Must be >= 1280. |
 | `icmp_rate_limit` | integer | `100` | Maximum ICMP Fragmentation Needed responses per second. Prevents amplification from oversized non-TCP traffic bursts. Set to 0 to disable ICMP generation. |
+
+##### `[forwarder.connection_ttls]`
+
+Per-protocol-and-state TTLs for the connection tracker. Any field not set
+defaults to the value derived from `connection_ttl` (TCP established) or
+sensible constants (5s handshake, 10s closing, 30s UDP/other). Matches the
+Maglev paper's behaviour (§3.3): short TTLs for half-open and closing flows
+so slots are reclaimed promptly under attack patterns like SYN floods or
+FIN scans, long TTL for established sessions.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `tcp_handshake` | string | `"5s"` | SYN seen, no ACK yet |
+| `tcp_established` | string | `connection_ttl` | After the first bare ACK (or initial data) |
+| `tcp_closing` | string | `"10s"` | FIN or RST seen — entry will expire quickly |
+| `udp` | string | `"30s"` | UDP flows (no state machine) |
+| `other` | string | `"30s"` | Any other L4 protocol |
+
+##### Connection-tracking metrics
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `lb_connection_table_hits_total` | counter | -- | Cache hits where the cached backend is still healthy |
+| `lb_connection_table_misses_total` | counter | -- | Cold misses (no entry existed for the flow) |
+| `lb_connection_table_fallback_to_maglev_total` | counter | -- | Hits where the cached backend became unhealthy — fell back to Maglev lookup and re-pinned |
+| `lb_connection_table_inserts_total` | counter | -- | New inserts (fresh or reclaimed from an expired slot) |
+| `lb_connection_table_evictions_total` | counter | `reason` ∈ `{expired_on_insert, dropped_full}` | Evictions during `insert`; `dropped_full` is the fall-through case where every probe slot was occupied (falls back to pure Maglev) |
+| `lb_connection_table_tcp_transitions_total` | counter | `to` ∈ `{established, closing_fin, closing_rst}` | TCP state transitions driven by observed flags |
+| `lb_connection_table_size` | gauge | -- | Current occupied entries per thread |
+| `lb_connection_table_fill_bp` | gauge | -- | Fill ratio in basis points (0–10 000, so 5000 = 50%) |
 
 #### `[health_check_defaults]`
 

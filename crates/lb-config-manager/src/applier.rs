@@ -85,7 +85,6 @@ pub fn apply_tables(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lb_types::*;
     use std::net::Ipv4Addr;
 
     fn make_config() -> LbConfig {

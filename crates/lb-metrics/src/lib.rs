@@ -1,7 +1,7 @@
 pub mod forwarder_metrics;
 pub mod controller_metrics;
 
-pub use forwarder_metrics::ForwarderMetrics;
+pub use forwarder_metrics::{EvictionLabels, ForwarderMetrics, TcpTransitionLabels};
 pub use controller_metrics::{BgpMetrics, ControllerMetrics, PeerLabels};
 
 use parking_lot::Mutex;

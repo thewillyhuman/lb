@@ -13,7 +13,7 @@
 //! so steering can reuse it. This mirrors AF_XDP's UMEM model.
 
 use crate::gre;
-use crate::conn_table::ConnTable;
+use crate::conn_table::{ConnTable, InsertResult};
 use crate::packet_pool::{FrameIndex, PacketPool};
 use crate::steering;
 use crate::vip_matcher::VipMatcher;
@@ -21,8 +21,10 @@ use crate::ForwarderConfig;
 use crossbeam::queue::ArrayQueue;
 use lb_hashing::LookupTable;
 use lb_io::{PacketBuf, PacketIo};
-use lb_metrics::ForwarderMetrics;
-use lb_types::{BackendPoolId, HealthStatus, PacketMeta};
+use lb_metrics::{EvictionLabels, ForwarderMetrics, TcpTransitionLabels};
+use lb_types::{
+    BackendPoolId, ConnTtls, FlowProto, HealthStatus, PacketMeta, TcpFlags, TcpFlowState,
+};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,7 +132,7 @@ impl MultiThreadedForwarder {
                 pool: Arc::clone(&pool),
                 src_ip: config.src_ip,
                 conn_table_size: config.connection_table_size,
-                conn_ttl: config.connection_ttl,
+                conn_ttls: config.conn_ttls,
                 lookup_tables: lookup_tables.clone(),
                 vip_matcher: Arc::clone(&vip_matcher),
                 health_status: Arc::clone(&health_status),
@@ -230,7 +232,7 @@ struct RewriterContext {
     pool: Arc<PacketPool>,
     src_ip: IpAddr,
     conn_table_size: usize,
-    conn_ttl: std::time::Duration,
+    conn_ttls: ConnTtls,
     lookup_tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
     vip_matcher: Arc<ArcSwap<VipMatcher>>,
     health_status: Arc<DashMap<IpAddr, HealthStatus>>,
@@ -239,7 +241,7 @@ struct RewriterContext {
 
 /// Rewriter loop: drain frame indices from RX queue, process in-place, push to TX queue.
 fn run_rewriter(ctx: RewriterContext, shutdown: &AtomicBool) {
-    let mut conn_table = ConnTable::new(ctx.conn_table_size, ctx.conn_ttl);
+    let mut conn_table = ConnTable::new(ctx.conn_table_size, ctx.conn_ttls);
     let mut indices = Vec::with_capacity(BATCH_DRAIN_SIZE);
     let mut spin_count = 0u32;
 
@@ -309,6 +311,8 @@ fn run_rewriter(ctx: RewriterContext, shutdown: &AtomicBool) {
             let lookup_table = lookup_table_swap.load();
 
             let flow_hash = meta.flow_hash();
+            let proto = FlowProto::from(meta.protocol);
+            let initial_state = initial_tcp_state(meta.tcp_flags);
 
             // Connection table lookup
             let backend_ip = if let Some(cached_ip) = conn_table.get(flow_hash, now) {
@@ -323,17 +327,37 @@ fn run_rewriter(ctx: RewriterContext, shutdown: &AtomicBool) {
                     conn_table.touch(flow_hash, now);
                     cached_ip
                 } else {
-                    ctx.metrics.conn_table_misses.inc();
+                    ctx.metrics.conn_table_fallback_to_maglev_total.inc();
                     let backend = lookup_table.lookup(flow_hash);
-                    conn_table.insert(flow_hash, backend.ip, now);
+                    insert_tracked(
+                        &mut conn_table,
+                        &ctx.metrics,
+                        flow_hash,
+                        backend.ip,
+                        proto,
+                        initial_state,
+                        now,
+                    );
                     backend.ip
                 }
             } else {
                 ctx.metrics.conn_table_misses.inc();
                 let backend = lookup_table.lookup(flow_hash);
-                conn_table.insert(flow_hash, backend.ip, now);
+                insert_tracked(
+                    &mut conn_table,
+                    &ctx.metrics,
+                    flow_hash,
+                    backend.ip,
+                    proto,
+                    initial_state,
+                    now,
+                );
                 backend.ip
             };
+
+            if let Some(flags) = meta.tcp_flags {
+                apply_tcp_transitions(&mut conn_table, &ctx.metrics, flow_hash, flags, now);
+            }
 
             let dst_ipv4 = match backend_ip {
                 IpAddr::V4(v4) => v4,
@@ -359,6 +383,91 @@ fn run_rewriter(ctx: RewriterContext, shutdown: &AtomicBool) {
         }
 
         ctx.metrics.conn_table_size.set(conn_table.len() as i64);
+        ctx.metrics.conn_table_fill_bp.set(conn_table.fill_bp());
+    }
+}
+
+#[inline(always)]
+fn initial_tcp_state(flags: Option<TcpFlags>) -> TcpFlowState {
+    match flags {
+        None => TcpFlowState::NotTcp,
+        Some(f) if f.rst() || f.fin() => TcpFlowState::Closing,
+        Some(f) if f.syn() && !f.ack() => TcpFlowState::Handshake,
+        Some(f) if f.ack() => TcpFlowState::Established,
+        Some(_) => TcpFlowState::Handshake,
+    }
+}
+
+#[inline(always)]
+fn insert_tracked(
+    conn_table: &mut ConnTable,
+    metrics: &ForwarderMetrics,
+    hash: u64,
+    backend_ip: IpAddr,
+    proto: FlowProto,
+    tcp_state: TcpFlowState,
+    now: std::time::Instant,
+) {
+    match conn_table.insert(hash, backend_ip, proto, tcp_state, now) {
+        InsertResult::Inserted | InsertResult::Updated => {
+            metrics.conn_table_inserts_total.inc();
+        }
+        InsertResult::EvictedExpired => {
+            metrics.conn_table_inserts_total.inc();
+            metrics
+                .conn_table_evictions_total
+                .get_or_create(&EvictionLabels {
+                    reason: "expired_on_insert".into(),
+                })
+                .inc();
+        }
+        InsertResult::DroppedFull => {
+            metrics
+                .conn_table_evictions_total
+                .get_or_create(&EvictionLabels {
+                    reason: "dropped_full".into(),
+                })
+                .inc();
+        }
+    }
+}
+
+#[inline(always)]
+fn apply_tcp_transitions(
+    conn_table: &mut ConnTable,
+    metrics: &ForwarderMetrics,
+    hash: u64,
+    flags: TcpFlags,
+    now: std::time::Instant,
+) {
+    if flags.rst() {
+        conn_table.mark_closing(hash, now);
+        metrics
+            .conn_table_tcp_transitions_total
+            .get_or_create(&TcpTransitionLabels {
+                to: "closing_rst".into(),
+            })
+            .inc();
+        return;
+    }
+    if flags.fin() {
+        conn_table.mark_closing(hash, now);
+        metrics
+            .conn_table_tcp_transitions_total
+            .get_or_create(&TcpTransitionLabels {
+                to: "closing_fin".into(),
+            })
+            .inc();
+        return;
+    }
+    if flags.ack() && !flags.syn() {
+        conn_table.mark_established(hash, now);
+        metrics
+            .conn_table_tcp_transitions_total
+            .get_or_create(&TcpTransitionLabels {
+                to: "established".into(),
+            })
+            .inc();
     }
 }
 
@@ -473,7 +582,7 @@ mod tests {
         let config = ForwarderConfig {
             src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
             connection_table_size: 64,
-            connection_ttl: Duration::from_secs(60),
+            conn_ttls: ConnTtls::with_established(Duration::from_secs(60)),
             batch_size: 64,
             mtu_config: lb_types::MtuConfig::new(1500).unwrap(),
             icmp_rate_limit: 100,
@@ -554,7 +663,7 @@ mod tests {
         let config = ForwarderConfig {
             src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
             connection_table_size: 64,
-            connection_ttl: Duration::from_secs(60),
+            conn_ttls: ConnTtls::with_established(Duration::from_secs(60)),
             batch_size: 64,
             mtu_config: lb_types::MtuConfig::new(1500).unwrap(),
             icmp_rate_limit: 100,
