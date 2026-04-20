@@ -1,3 +1,5 @@
+mod ops_server;
+
 use clap::Parser;
 use lb_bgp::{BgpAnnouncer, BgpEvent, BgpSpeaker};
 use lb_config_manager::loader::LbConfig;
@@ -13,10 +15,13 @@ use lb_types::{BackendPoolId, HealthStatus, NodeConfig};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+
+use crate::ops_server::OpsState;
 
 #[derive(Parser)]
 #[command(name = "lb-node", version, about = "LB node: forwarder + controller")]
@@ -74,8 +79,15 @@ fn main() {
     let health_status: Arc<DashMap<IpAddr, HealthStatus>> = Arc::new(DashMap::new());
     let vip_matcher = Arc::new(ArcSwap::from_pointee(VipMatcher::new()));
 
-    // Metrics
-    let metrics = LbMetrics::new();
+    // Metrics. Wrapped in an Arc so the ops HTTP server and the BGP event
+    // pump share a single registry.
+    let metrics = Arc::new(LbMetrics::new());
+
+    // Readiness flag flipped after the initial config has been applied.
+    // The `/readyz` endpoint consults it along with the forwarder's liveness
+    // flag, so load balancers / systemd notify can steer traffic only when
+    // the node is fully primed.
+    let ready = Arc::new(AtomicBool::new(false));
 
     // Try to load initial LB config (per ADR-001: from local file)
     let initial_lb_config = if config.control_plane.config_file.exists() {
@@ -144,10 +156,11 @@ fn main() {
     // for the event loop. We use a blocking Mutex because event bursts are
     // infrequent and the critical section is tiny (flip a set of VIPs).
     let controller = Arc::new(parking_lot::Mutex::new(controller));
+    let bgp_handle = bgp_runtime.handle().clone();
     if let Some(mut rx) = bgp_events {
         let controller_for_events = Arc::clone(&controller);
         let bgp_metrics = metrics.controller.bgp.clone();
-        bgp_runtime.spawn(async move {
+        bgp_handle.spawn(async move {
             while let Some(evt) = rx.recv().await {
                 match evt {
                     BgpEvent::PeerConnected { peer_ip } => {
@@ -229,6 +242,39 @@ fn main() {
             metrics: metrics.forwarder.clone(),
         },
     );
+    let forwarder = Arc::new(forwarder);
+
+    // Spawn the operations HTTP server (`/healthz`, `/readyz`, `/metrics`).
+    // Binds lazily so the process comes up even if the port is taken; errors
+    // are logged but non-fatal — the forwarder is still running without it.
+    {
+        let ops_state = OpsState {
+            metrics: Arc::clone(&metrics),
+            ready: Arc::clone(&ready),
+            forwarder_running: {
+                let f = Arc::clone(&forwarder);
+                Arc::new(move || f.is_running())
+            },
+        };
+        let ops_addr = config.node.metrics_addr;
+        bgp_handle.spawn(async move {
+            match ops_server::serve(ops_addr, ops_state).await {
+                Ok((_, fut)) => {
+                    if let Err(e) = fut.await {
+                        tracing::error!(%ops_addr, error = %e, "ops HTTP server exited");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(%ops_addr, error = %e, "ops HTTP server failed to bind");
+                }
+            }
+        });
+    }
+
+    // Initial config has been applied (or we've decided to run empty).
+    // Flip readiness now so `/readyz` starts returning 200 and load balancers
+    // / systemd notify can start steering traffic at the forwarder.
+    ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Config file watcher thread (per ADR-001: inotify-based reload)
     if let Some((watcher, _)) = initial_lb_config {
