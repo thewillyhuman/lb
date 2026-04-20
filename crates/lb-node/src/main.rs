@@ -280,30 +280,60 @@ fn main() {
     // / systemd notify can start steering traffic at the forwarder.
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
-    // Config file watcher thread (per ADR-001: inotify-based reload)
+    // Config file watcher (per ADR-001: inotify-based reload).
+    //
+    // Reload flow: the watcher thread (sync, blocks on inotify) forwards each
+    // new `LbConfig` over an `mpsc::channel` to an apply-task on the BGP
+    // runtime. The apply-task rebuilds the VIP matcher *and* calls
+    // `Controller::apply_config`, which rebuilds lookup tables and diffs BGP
+    // announcements. Previously only the VIP matcher was rebuilt — lookup
+    // tables stayed stale and BGP announces didn't track config changes.
+    //
+    // Known limitation: `apply_tables` only updates *existing* pool IDs in the
+    // shared HashMap. Adding a brand-new pool at runtime still requires a
+    // restart; membership changes within existing pools and VIP->pool
+    // remapping both work.
     if let Some((watcher, _)) = initial_lb_config {
-        let vip_matcher_clone = vip_matcher.clone();
+        let (config_tx, mut config_rx) = tokio::sync::mpsc::unbounded_channel::<LbConfig>();
 
+        // Apply-task: runs on the BGP runtime, receives new configs, rebuilds
+        // VIP matcher + calls controller.apply_config under the controller's
+        // Mutex.
+        {
+            let controller = Arc::clone(&controller);
+            let vip_matcher = vip_matcher.clone();
+            bgp_handle.spawn(async move {
+                while let Some(new_config) = config_rx.recv().await {
+                    tracing::info!(
+                        vips = new_config.vips.len(),
+                        pools = new_config.pools.len(),
+                        "applying reloaded config"
+                    );
+                    // Rebuild and swap the VIP matcher atomically so the
+                    // forwarder sees either the old or new state, never a
+                    // torn read.
+                    let new_matcher = build_vip_matcher(&new_config);
+                    vip_matcher.store(Arc::new(new_matcher));
+                    // Let the controller rebuild lookup tables and
+                    // reconcile BGP announcements. `apply_config` also
+                    // caches the validated config to disk.
+                    controller.lock().apply_config(new_config);
+                }
+            });
+        }
+
+        // Watcher thread: sync, inotify-driven. Feeds `config_tx`. Stops when
+        // the channel is closed (i.e., on process shutdown).
         std::thread::Builder::new()
             .name("lb-config-watcher".into())
             .spawn(move || {
                 tracing::info!("config file watcher started");
                 loop {
                     let new_config = watcher.wait_for_change();
-                    tracing::info!(
-                        vips = new_config.vips.len(),
-                        pools = new_config.pools.len(),
-                        "applying reloaded config"
-                    );
-
-                    // Rebuild VIP matcher
-                    let new_matcher = build_vip_matcher(&new_config);
-                    vip_matcher_clone.store(Arc::new(new_matcher));
-
-                    // Note: controller.apply_config() would also need to be
-                    // called here in a full implementation. For now, the VIP
-                    // matcher is updated directly. A production setup would
-                    // use a channel to send the new config to the controller.
+                    if config_tx.send(new_config).is_err() {
+                        tracing::info!("config apply-task gone, watcher exiting");
+                        break;
+                    }
                 }
             })
             .expect("failed to spawn config watcher thread");
