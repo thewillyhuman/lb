@@ -75,9 +75,7 @@ fn main() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     match std::env::var("LB_LOG_FORMAT").as_deref() {
-        Ok("pretty") => tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .init(),
+        Ok("pretty") => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
         _ => tracing_subscriber::fmt()
             .json()
             .with_env_filter(env_filter)
