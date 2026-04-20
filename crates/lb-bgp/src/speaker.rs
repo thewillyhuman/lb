@@ -69,7 +69,10 @@ struct PeerHandle {
     peer_ip: IpAddr,
     tx: mpsc::UnboundedSender<SessionCmd>,
     state: Arc<Mutex<PeerState>>,
-    task: Option<JoinHandle<()>>,
+    /// Wrapped in a Mutex so `shutdown` can take the `JoinHandle` out through
+    /// `&self`, letting the speaker sit behind `Arc` without interior-mutability
+    /// ceremony at the announce/withdraw call sites.
+    task: Mutex<Option<JoinHandle<()>>>,
     enabled: bool,
 }
 
@@ -145,7 +148,7 @@ impl BgpSpeaker {
                 peer_ip: peer_cfg.peer_ip,
                 tx,
                 state,
-                task: handle,
+                task: Mutex::new(handle),
                 enabled: peer_cfg.enabled,
             });
         }
@@ -160,12 +163,19 @@ impl BgpSpeaker {
     }
 
     /// Graceful shutdown: signal every peer session to terminate, then await.
-    pub async fn shutdown(&mut self) {
+    ///
+    /// Takes `&self` so the speaker can live behind `Arc` and be shut down
+    /// from a signal handler without needing exclusive ownership. Awaiting
+    /// the `JoinHandle`s is cheap (they typically resolve within a TCP RST
+    /// round-trip) so we don't need to impose a deadline here — callers that
+    /// want bounded shutdown time should wrap with `tokio::time::timeout`.
+    pub async fn shutdown(&self) {
         for peer in &self.peers {
             let _ = peer.tx.send(SessionCmd::Shutdown);
         }
-        for peer in self.peers.iter_mut() {
-            if let Some(task) = peer.task.take() {
+        for peer in &self.peers {
+            let handle = peer.task.lock().take();
+            if let Some(task) = handle {
                 let _ = task.await;
             }
         }
