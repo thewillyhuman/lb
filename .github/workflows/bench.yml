@@ -53,29 +53,58 @@ jobs:
       - name: Compile benches (no run)
         # Pre-build first so each `cargo bench` step output is just the
         # measurement section, keeping the log readable.
+        #
+        # Each entry is "crate:bench-name". We target criterion benches by
+        # explicit name so `cargo bench` does not also try to run the
+        # crate's implicit libtest bench target (which would reject the
+        # `--warm-up-time` / `--measurement-time` flags criterion
+        # understands). Keep this list in sync with `[[bench]]` entries in
+        # the crate Cargo.tomls.
         run: |
           set -euxo pipefail
-          CRATES=(lb-hashing lb-forwarder lb-controller lb-bgp)
+          BENCHES=(
+            "lb-hashing:hashing_bench"
+            "lb-forwarder:forwarding_bench"
+            "lb-controller:controller_bench"
+            "lb-bgp:bgp_bench"
+          )
           if [[ -n "${{ github.event.inputs.crate }}" ]]; then
-            CRATES=("${{ github.event.inputs.crate }}")
+            FILTERED=()
+            for entry in "${BENCHES[@]}"; do
+              [[ "${entry%%:*}" == "${{ github.event.inputs.crate }}" ]] && FILTERED+=("$entry")
+            done
+            BENCHES=("${FILTERED[@]}")
           fi
-          for c in "${CRATES[@]}"; do
-            cargo bench -p "$c" --no-run
+          for entry in "${BENCHES[@]}"; do
+            crate="${entry%%:*}"
+            bench="${entry##*:}"
+            cargo bench -p "$crate" --bench "$bench" --no-run
           done
 
       - name: Run benches
         run: |
           set -euxo pipefail
-          CRATES=(lb-hashing lb-forwarder lb-controller lb-bgp)
+          BENCHES=(
+            "lb-hashing:hashing_bench"
+            "lb-forwarder:forwarding_bench"
+            "lb-controller:controller_bench"
+            "lb-bgp:bgp_bench"
+          )
           if [[ -n "${{ github.event.inputs.crate }}" ]]; then
-            CRATES=("${{ github.event.inputs.crate }}")
+            FILTERED=()
+            for entry in "${BENCHES[@]}"; do
+              [[ "${entry%%:*}" == "${{ github.event.inputs.crate }}" ]] && FILTERED+=("$entry")
+            done
+            BENCHES=("${FILTERED[@]}")
           fi
           # Short measurement time keeps CI runtime sane while still
           # producing meaningful numbers. Operators who want publication-
           # quality measurements should run benches locally on a quiet
           # machine.
-          for c in "${CRATES[@]}"; do
-            cargo bench -p "$c" -- --warm-up-time 1 --measurement-time 2
+          for entry in "${BENCHES[@]}"; do
+            crate="${entry%%:*}"
+            bench="${entry##*:}"
+            cargo bench -p "$crate" --bench "$bench" -- --warm-up-time 1 --measurement-time 2
           done
 
       - name: Upload criterion report
