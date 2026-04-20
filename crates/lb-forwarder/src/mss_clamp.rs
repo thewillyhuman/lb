@@ -1,8 +1,8 @@
-/// TCP MSS clamping for GRE tunnel MTU compliance.
-///
-/// Parses the TCP options field on SYN/SYN-ACK packets and rewrites the
-/// MSS option if it exceeds `max_mss`. Uses incremental checksum update
-/// (RFC 1624) so only the 2 changed bytes are recomputed — O(1).
+//! TCP MSS clamping for GRE tunnel MTU compliance.
+//!
+//! Parses the TCP options field on SYN/SYN-ACK packets and rewrites the
+//! MSS option if it exceeds `max_mss`. Uses incremental checksum update
+//! (RFC 1624) so only the 2 changed bytes are recomputed — O(1).
 
 /// TCP option kinds.
 const TCP_OPT_END: u8 = 0;
@@ -175,7 +175,7 @@ fn full_tcp_checksum(data: &[u8], ihl: usize) -> u16 {
         sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
         i += 2;
     }
-    if (data.len() - tcp_start) % 2 != 0 {
+    if !(data.len() - tcp_start).is_multiple_of(2) {
         sum += (data[data.len() - 1] as u32) << 8;
     }
 

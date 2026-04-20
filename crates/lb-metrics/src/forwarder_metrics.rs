@@ -1,4 +1,6 @@
+use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
@@ -13,6 +15,12 @@ pub struct ForwarderMetrics {
     pub conn_table_misses: Counter,
     pub conn_table_size: Gauge,
     pub processing_latency_ns: Histogram,
+    // Connection-tracking details (aligns with Maglev paper §3.3)
+    pub conn_table_inserts_total: Counter,
+    pub conn_table_evictions_total: Family<EvictionLabels, Counter>,
+    pub conn_table_tcp_transitions_total: Family<TcpTransitionLabels, Counter>,
+    pub conn_table_fallback_to_maglev_total: Counter,
+    pub conn_table_fill_bp: Gauge,
     // MTU handling metrics
     pub mss_clamp_total: Counter,
     pub mss_clamp_noop_total: Counter,
@@ -20,6 +28,19 @@ pub struct ForwarderMetrics {
     pub icmp_frag_needed_sent_total: Counter,
     pub icmp_frag_needed_ratelimited_total: Counter,
     pub packets_oversized_dropped_total: Counter,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct EvictionLabels {
+    /// `expired_on_insert` when an expired slot was reclaimed on insert,
+    /// `dropped_full` when every probe slot was occupied.
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TcpTransitionLabels {
+    /// `established`, `closing_fin`, or `closing_rst`.
+    pub to: String,
 }
 
 impl ForwarderMetrics {
@@ -39,6 +60,12 @@ impl ForwarderMetrics {
         let icmp_frag_needed_sent_total = Counter::default();
         let icmp_frag_needed_ratelimited_total = Counter::default();
         let packets_oversized_dropped_total = Counter::default();
+        let conn_table_inserts_total = Counter::default();
+        let conn_table_evictions_total: Family<EvictionLabels, Counter> = Family::default();
+        let conn_table_tcp_transitions_total: Family<TcpTransitionLabels, Counter> =
+            Family::default();
+        let conn_table_fallback_to_maglev_total = Counter::default();
+        let conn_table_fill_bp = Gauge::default();
 
         registry.register(
             "lb_packets_received_total",
@@ -105,6 +132,31 @@ impl ForwarderMetrics {
             "Oversized packets dropped (DF set, exceeds inner MTU)",
             packets_oversized_dropped_total.clone(),
         );
+        registry.register(
+            "lb_connection_table_inserts_total",
+            "Connection tracking insertions (new or reclaimed expired slot)",
+            conn_table_inserts_total.clone(),
+        );
+        registry.register(
+            "lb_connection_table_evictions_total",
+            "Connection tracking evictions labelled by reason",
+            conn_table_evictions_total.clone(),
+        );
+        registry.register(
+            "lb_connection_table_tcp_transitions_total",
+            "TCP flow state transitions observed by the connection tracker",
+            conn_table_tcp_transitions_total.clone(),
+        );
+        registry.register(
+            "lb_connection_table_fallback_to_maglev_total",
+            "Cache hit re-routed via Maglev because the cached backend became unhealthy",
+            conn_table_fallback_to_maglev_total.clone(),
+        );
+        registry.register(
+            "lb_connection_table_fill_bp",
+            "Connection table fill ratio in basis points (0-10000)",
+            conn_table_fill_bp.clone(),
+        );
 
         Self {
             packets_received,
@@ -114,6 +166,11 @@ impl ForwarderMetrics {
             conn_table_misses,
             conn_table_size,
             processing_latency_ns,
+            conn_table_inserts_total,
+            conn_table_evictions_total,
+            conn_table_tcp_transitions_total,
+            conn_table_fallback_to_maglev_total,
+            conn_table_fill_bp,
             mss_clamp_total,
             mss_clamp_noop_total,
             mss_clamp_missing_total,

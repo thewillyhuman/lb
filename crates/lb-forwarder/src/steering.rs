@@ -20,6 +20,7 @@ mod tests {
             src_port,
             dst_port: 443,
             protocol: Protocol::Tcp,
+            tcp_flags: None,
         }
     }
 

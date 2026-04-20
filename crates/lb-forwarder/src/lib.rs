@@ -12,11 +12,10 @@ pub mod vip_matcher;
 use lb_io::{PacketBuf, PacketIo};
 use lb_hashing::LookupTable;
 use lb_metrics::ForwarderMetrics;
-use lb_types::{BackendPoolId, HealthStatus, MtuConfig};
+use lb_types::{BackendPoolId, ConnTtls, HealthStatus, MtuConfig};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -28,7 +27,7 @@ use crate::vip_matcher::VipMatcher;
 pub struct ForwarderConfig {
     pub src_ip: IpAddr,
     pub connection_table_size: usize,
-    pub connection_ttl: Duration,
+    pub conn_ttls: ConnTtls,
     pub batch_size: usize,
     pub mtu_config: MtuConfig,
     pub icmp_rate_limit: u32,
@@ -53,7 +52,7 @@ impl<T: PacketIo> ForwarderEngine<T> {
         let rewriter = RewriterThread::new(
             config.src_ip,
             config.connection_table_size,
-            config.connection_ttl,
+            config.conn_ttls,
             lookup_tables,
             vip_matcher,
             health_status,
@@ -147,7 +146,7 @@ mod tests {
         let config = ForwarderConfig {
             src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
             connection_table_size: 64,
-            connection_ttl: Duration::from_secs(60),
+            conn_ttls: ConnTtls::with_established(std::time::Duration::from_secs(60)),
             batch_size: 64,
             mtu_config: MtuConfig::new(1500).unwrap(),
             icmp_rate_limit: 100,

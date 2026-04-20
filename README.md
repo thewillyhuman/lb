@@ -5,7 +5,7 @@ A high-performance L4 packet-forwarding load balancer written in Rust, inspired 
 ## Features
 
 - **Maglev consistent hashing** -- minimal disruption when backends change, deterministic backend selection across all LB nodes without coordination
-- **Connection tracking** -- per-flow affinity via fixed-size Robin Hood hash table with TTL-based eviction and O(ln n) bounded probe length
+- **Connection tracking** -- per-flow affinity via fixed-size Robin Hood hash table with O(ln n) bounded probe length. Entries carry a TCP-state tag (`Handshake` / `Established` / `Closing`) driven by on-the-wire SYN/FIN/RST/ACK flags so half-open flows and graceful-closed flows expire on a short TTL while established TCP uses the long operator-chosen TTL; UDP has its own bucket. Per-protocol TTLs are configurable via `[forwarder.connection_ttls]` (see `config/lb.example.toml`)
 - **GRE encapsulation** -- RFC 2784 tunneling to backends, supports IPv4/IPv6 inner packets, Direct Server Return (DSR)
 - **MTU-aware tunneling** -- automatic MSS clamping on TCP SYN/SYN-ACK (incremental checksum, RFC 1624), ICMP Fragmentation Needed generation for oversized non-TCP packets with DF set, rate-limited. Operator sets `network_mtu`; all tunnel parameters derived automatically
 - **Kernel bypass I/O** -- AF_XDP and DPDK backends for line-rate packet processing on commodity hardware
@@ -55,8 +55,11 @@ cascading_rebuild/all_pools/200      216 ms      (1.08 ms/pool)
 
 ```
 gre_encapsulate_ipv4                74.9 ns     (in-place, 40-byte inner packet)
-conn_table_lookup_10k               75.9 µs     (7.6 ns/lookup, 15% fill, Robin Hood)
-full_pipeline_per_packet            394 µs       (394 ns/pkt: parse + VIP match + conn miss + Maglev + GRE)
+conn_table_lookup_10k               80.7 µs     (8.1 ns/lookup, 15% fill, Robin Hood, per-state TTL)
+conn_table_mark_established_10k     24.6 µs     (2.5 ns/op, TCP handshake → Established promotion)
+conn_table_mark_closing_10k         22.2 µs     (2.2 ns/op, FIN/RST → Closing transition)
+conn_table_mixed_protocol_70pct     88.8 µs     (8.9 ns/lookup at 70% fill, TCP/UDP/Other mix)
+full_pipeline_per_packet            406 µs       (406 ns/pkt: parse + VIP match + conn miss + Maglev + GRE + TCP state)
 ```
 
 **Connection table under load (Robin Hood hashing, skewed 80/20 distribution, 1000 lookups)**

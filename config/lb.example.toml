@@ -39,9 +39,22 @@ connection_table_size  = 131072     # per thread, must be power of two. ≥ 2× 
 fragment_table_size    = 8192
 batch_size             = 64
 batch_flush_interval   = "50us"
+# Legacy single-TTL knob. Used as the default for tcp_established when
+# [forwarder.connection_ttls] is not provided below.
 connection_ttl         = "60s"
 network_mtu            = 1500       # link MTU; derives inner MTU (1476) and TCP MSS clamp (1436)
 icmp_rate_limit        = 100        # max ICMP Frag Needed responses/sec per VIP
+
+# Optional per-protocol-and-state TTLs for the connection tracker.
+# Matches Maglev (NSDI '16 §3.3): short TTL on TCP handshake to clear
+# half-open connections, long TTL on established TCP, short TTL on closing
+# TCP (FIN/RST seen) to reclaim slots promptly.
+# [forwarder.connection_ttls]
+# tcp_handshake   = "5s"
+# tcp_established = "60s"
+# tcp_closing     = "10s"
+# udp             = "30s"
+# other           = "30s"
 
 [health_check_defaults]
 interval             = "5s"

@@ -145,7 +145,7 @@ fn ip_checksum(data: &[u8]) -> u16 {
         sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
         i += 2;
     }
-    if data.len() % 2 != 0 {
+    if !data.len().is_multiple_of(2) {
         sum += (data[data.len() - 1] as u32) << 8;
     }
     while sum > 0xFFFF {

@@ -463,8 +463,14 @@ else:
 - Collision resolution: open addressing with **Robin Hood hashing**. On insert, entries with shorter probe distances are displaced by entries with longer probe distances, bounding worst-case probe length to O(ln n) instead of linear probing's O(1/(1-alpha)^2). This is critical for miss performance under SYN floods.
 - Early termination on miss: a lookup can stop as soon as it encounters an entry with a probe distance shorter than the current search distance, avoiding full-table scans at high fill ratios.
 - Batch timestamp: a single `Instant::now()` is captured per batch of 64 packets and passed to all connection table operations, eliminating per-packet clock_gettime overhead.
-- Eviction: entries expire after a configurable TTL (default: 60 seconds of inactivity). There is no active eviction thread — entries are lazily reclaimed on collision during insert.
-- Under SYN flood: the table may saturate. When full, the forwarder falls back to pure consistent hashing for new entries without storing them. This degrades connection persistence but maintains forwarding correctness.
+- **TCP state-aware eviction** (Maglev §3.3). Each entry carries a protocol tag and, for TCP, a state (`Handshake` → `Established` → `Closing`). State transitions are driven from the on-the-wire TCP flags observed in the forwarder's hot path:
+  - SYN without ACK → `Handshake` (short TTL, default 5s). Clears half-open connections left behind by SYN scans or SYN floods without requiring the table to saturate first.
+  - Bare ACK after handshake → `Established` (long TTL, default 60s or `connection_ttl`).
+  - FIN or RST → `Closing` (short TTL, default 10s). Graceful-closed flows vacate their slot promptly.
+  - The promotion from `Handshake`/`Established` to `Closing` is monotonic: a late retransmitted SYN-ACK cannot undo a `Closing` transition.
+- Per-protocol TTLs: TCP buckets (handshake / established / closing), UDP, and `Other` each have independent TTLs configured via `[forwarder.connection_ttls]`.
+- Under SYN flood: the table may saturate. When full, the forwarder falls back to pure consistent hashing for new entries without storing them. The `tcp_handshake` TTL acts as a release valve — half-open entries expire within 5s by default so sustained SYN attacks do not permanently pin the table.
+- **Observability**: eviction counters labelled by reason (`expired_on_insert`, `dropped_full`), TCP transition counters (`established`, `closing_fin`, `closing_rst`), fall-back-to-Maglev counter, and a fill-ratio gauge in basis points. See `.docs/operations.md` for the full list.
 
 **Why per-thread tables are sufficient:**
 
@@ -945,9 +951,14 @@ Each LB node exposes a Prometheus metrics endpoint at `http://<node_ip>:9100/met
 | `lb_packets_received_total` | Counter | Total packets received by the steering module |
 | `lb_packets_forwarded_total` | Counter | Total packets successfully GRE-forwarded |
 | `lb_packets_dropped_total` | Counter | Total packets dropped (no VIP match, no healthy backend, pool full) |
-| `lb_connection_table_hits_total` | Counter | Connection tracking cache hits |
-| `lb_connection_table_misses_total` | Counter | Connection tracking cache misses (fell back to consistent hash) |
+| `lb_connection_table_hits_total` | Counter | Connection tracking cache hits (cached backend still healthy) |
+| `lb_connection_table_misses_total` | Counter | Cold misses — no entry existed for the flow |
+| `lb_connection_table_fallback_to_maglev_total` | Counter | Hits where the cached backend became unhealthy; the flow was repinned via Maglev |
+| `lb_connection_table_inserts_total` | Counter | Inserts (fresh or into a reclaimed-expired slot) |
+| `lb_connection_table_evictions_total` | Counter | Labelled by `reason` ∈ {`expired_on_insert`, `dropped_full`} |
+| `lb_connection_table_tcp_transitions_total` | Counter | Labelled by `to` ∈ {`established`, `closing_fin`, `closing_rst`} |
 | `lb_connection_table_size` | Gauge | Current number of active entries in connection table (per thread) |
+| `lb_connection_table_fill_bp` | Gauge | Fill ratio in basis points (0–10000) |
 | `lb_packet_processing_latency_ns` | Histogram | Per-packet processing latency in nanoseconds |
 | `lb_throughput_pps` | Gauge | Current packets per second |
 | `lb_throughput_bps` | Gauge | Current bits per second |

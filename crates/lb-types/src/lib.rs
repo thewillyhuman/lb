@@ -7,9 +7,10 @@ pub mod vip;
 
 pub use backend::{Backend, BackendPool, BackendPoolId, HealthStatus};
 pub use config::{
-    BgpConfig, BgpPeerConfig, ControlPlaneConfig, ForwarderConfig, HealthCheckConfig, NodeConfig,
+    BgpConfig, BgpPeerConfig, ConnTtls, ConnTtlsConfig, ControlPlaneConfig, ForwarderConfig,
+    HealthCheckConfig, NodeConfig,
 };
 pub use error::LbError;
 pub use mtu::MtuConfig;
-pub use packet::{FragmentId, PacketMeta};
+pub use packet::{FlowProto, FragmentId, PacketMeta, TcpFlags, TcpFlowState};
 pub use vip::{Protocol, Vip, VipId, VipService};

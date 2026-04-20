@@ -203,7 +203,7 @@ fn main() {
     let fwd_config = ForwarderConfig {
         src_ip: config.node.loopback_ip,
         connection_table_size: config.forwarder.connection_table_size,
-        connection_ttl: config.forwarder.connection_ttl,
+        conn_ttls: config.forwarder.resolved_conn_ttls(),
         batch_size: config.forwarder.batch_size,
         mtu_config,
         icmp_rate_limit: config.forwarder.icmp_rate_limit,
