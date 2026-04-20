@@ -7,10 +7,7 @@ pub struct ValidationError {
 }
 
 /// Validate a complete LB configuration.
-pub fn validate(
-    vips: &[Vip],
-    pools: &HashMap<String, BackendPool>,
-) -> Result<(), ValidationError> {
+pub fn validate(vips: &[Vip], pools: &HashMap<String, BackendPool>) -> Result<(), ValidationError> {
     let mut errors = Vec::new();
 
     // Check for dangling pool references in VIP services
@@ -70,10 +67,7 @@ mod tests {
     fn test_pool() -> BackendPool {
         BackendPool {
             id: BackendPoolId("web".into()),
-            backends: vec![Backend::new(
-                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-                443,
-            )],
+            backends: vec![Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443)],
             health_check: None,
         }
     }

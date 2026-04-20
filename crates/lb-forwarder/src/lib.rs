@@ -9,8 +9,8 @@ pub mod steering;
 pub mod threading;
 pub mod vip_matcher;
 
-use lb_io::{PacketBuf, PacketIo};
 use lb_hashing::LookupTable;
+use lb_io::{PacketBuf, PacketIo};
 use lb_metrics::ForwarderMetrics;
 use lb_types::{BackendPoolId, ConnTtls, HealthStatus, MtuConfig};
 use std::collections::HashMap;
@@ -131,7 +131,10 @@ mod tests {
         let pool_id = BackendPoolId("web".into());
 
         let mut tables = HashMap::new();
-        tables.insert(pool_id.clone(), Arc::new(ArcSwap::from_pointee(lookup_table)));
+        tables.insert(
+            pool_id.clone(),
+            Arc::new(ArcSwap::from_pointee(lookup_table)),
+        );
 
         let vip_matcher = vip_matcher::VipMatcher::from_entries(vec![(
             IpAddr::V4(Ipv4Addr::new(188, 184, 100, 10)),
@@ -192,4 +195,3 @@ mod tests {
         }
     }
 }
-

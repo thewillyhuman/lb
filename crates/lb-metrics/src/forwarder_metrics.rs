@@ -51,9 +51,8 @@ impl ForwarderMetrics {
         let conn_table_hits = Counter::default();
         let conn_table_misses = Counter::default();
         let conn_table_size = Gauge::default();
-        let processing_latency_ns = Histogram::new(
-            [100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0],
-        );
+        let processing_latency_ns =
+            Histogram::new([100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0]);
         let mss_clamp_total = Counter::default();
         let mss_clamp_noop_total = Counter::default();
         let mss_clamp_missing_total = Counter::default();

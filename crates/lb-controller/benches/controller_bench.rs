@@ -120,7 +120,10 @@ fn make_correlated_config(
 fn setup_controller(
     config: &LbConfig,
     table_size: usize,
-) -> (Controller, HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>) {
+) -> (
+    Controller,
+    HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
+) {
     let mut tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>> = HashMap::new();
     for pool in &config.pools {
         let table = LookupTable::build(&pool.backends, table_size).unwrap();
@@ -156,16 +159,10 @@ fn bench_single_backend_flap(c: &mut Criterion) {
                 let flapping_ip = IpAddr::V4(Ipv4Addr::new(10, 255, 255, 1));
 
                 b.iter(|| {
-                    controller.on_health_change(
-                        black_box(flapping_ip),
-                        HealthStatus::Unhealthy,
-                    );
+                    controller.on_health_change(black_box(flapping_ip), HealthStatus::Unhealthy);
                     controller.flush_pending();
                     // Restore for next iteration
-                    controller.on_health_change(
-                        black_box(flapping_ip),
-                        HealthStatus::Healthy,
-                    );
+                    controller.on_health_change(black_box(flapping_ip), HealthStatus::Healthy);
                     controller.flush_pending();
                 })
             },
@@ -180,17 +177,11 @@ fn bench_single_backend_flap(c: &mut Criterion) {
                 let flapping_ip = IpAddr::V4(Ipv4Addr::new(10, 255, 255, 1));
 
                 b.iter(|| {
-                    controller.on_health_change(
-                        black_box(flapping_ip),
-                        HealthStatus::Unhealthy,
-                    );
+                    controller.on_health_change(black_box(flapping_ip), HealthStatus::Unhealthy);
                     // Single flush covers all affected pools
                     controller.flush_pending();
                     // Restore
-                    controller.on_health_change(
-                        black_box(flapping_ip),
-                        HealthStatus::Healthy,
-                    );
+                    controller.on_health_change(black_box(flapping_ip), HealthStatus::Healthy);
                     controller.flush_pending();
                 })
             },
@@ -254,7 +245,7 @@ fn bench_correlated_failure(c: &mut Criterion) {
                         controller.on_health_change(black_box(ip), HealthStatus::Unhealthy);
                     }
                     controller.flush_pending(); // single flush
-                    // Restore
+                                                // Restore
                     for &ip in &failing_ips {
                         controller.on_health_change(black_box(ip), HealthStatus::Healthy);
                     }
@@ -295,17 +286,13 @@ fn bench_apply_config(c: &mut Criterion) {
     for num_pools in [10, 50, 100] {
         let config = make_config(num_pools, 20);
 
-        group.bench_with_input(
-            BenchmarkId::new("pools", num_pools),
-            &num_pools,
-            |b, _| {
-                let (mut controller, _tables) = setup_controller(&config, table_size);
+        group.bench_with_input(BenchmarkId::new("pools", num_pools), &num_pools, |b, _| {
+            let (mut controller, _tables) = setup_controller(&config, table_size);
 
-                b.iter(|| {
-                    controller.apply_config(black_box(config.clone()));
-                })
-            },
-        );
+            b.iter(|| {
+                controller.apply_config(black_box(config.clone()));
+            })
+        });
     }
 
     group.finish();

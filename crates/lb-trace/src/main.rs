@@ -50,7 +50,10 @@ fn main() {
         protocol,
     };
 
-    println!("Tracing flow: {src_ip}:{src_port} -> {dst_ip}:{dst_port} ({:?})", protocol);
+    println!(
+        "Tracing flow: {src_ip}:{src_port} -> {dst_ip}:{dst_port} ({:?})",
+        protocol
+    );
     println!("Trace request: {request:?}");
     println!("(Full trace execution requires a running LB cluster)");
 }

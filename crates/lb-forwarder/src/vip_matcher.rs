@@ -35,7 +35,12 @@ impl VipMatcher {
     }
 
     /// Match a packet's destination to a backend pool.
-    pub fn match_packet(&self, dst_ip: IpAddr, protocol: Protocol, dst_port: u16) -> Option<&BackendPoolId> {
+    pub fn match_packet(
+        &self,
+        dst_ip: IpAddr,
+        protocol: Protocol,
+        dst_port: u16,
+    ) -> Option<&BackendPoolId> {
         self.table.get(&VipKey {
             ip: dst_ip,
             protocol,

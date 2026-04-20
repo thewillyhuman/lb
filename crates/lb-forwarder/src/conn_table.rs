@@ -546,13 +546,7 @@ mod tests {
             );
         }
         assert_eq!(
-            table.insert(
-                999,
-                ip(99),
-                FlowProto::Tcp,
-                TcpFlowState::Established,
-                now
-            ),
+            table.insert(999, ip(99), FlowProto::Tcp, TcpFlowState::Established, now),
             InsertResult::DroppedFull
         );
         assert_eq!(table.len(), 4);

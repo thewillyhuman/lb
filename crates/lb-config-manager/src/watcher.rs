@@ -134,9 +134,10 @@ fn is_relevant_event(event: &Event, config_path: &Path) -> bool {
     }
 
     let config_name = config_path.file_name();
-    event.paths.iter().any(|p| {
-        p == config_path || (config_name.is_some() && p.file_name() == config_name)
-    })
+    event
+        .paths
+        .iter()
+        .any(|p| p == config_path || (config_name.is_some() && p.file_name() == config_name))
 }
 
 #[cfg(test)]

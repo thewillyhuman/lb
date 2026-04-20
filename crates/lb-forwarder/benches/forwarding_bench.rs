@@ -129,7 +129,10 @@ fn bench_conn_table_high_fill(c: &mut Criterion) {
         let (insert_keys, lookup_keys) = skewed_keys(capacity, fill_pct);
 
         let now = Instant::now();
-        let mut table = ConnTable::new(capacity, ConnTtls::with_established(Duration::from_secs(60)));
+        let mut table = ConnTable::new(
+            capacity,
+            ConnTtls::with_established(Duration::from_secs(60)),
+        );
         for (i, &key) in insert_keys.iter().enumerate() {
             table.insert(
                 key,
@@ -188,9 +191,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
     let vip_ip = IpAddr::V4(Ipv4Addr::new(188, 184, 100, 10));
     let pool_id = BackendPoolId("web".into());
 
-    let vip_matcher = VipMatcher::from_entries(vec![
-        (vip_ip, Protocol::Tcp, 443, pool_id.clone()),
-    ]);
+    let vip_matcher = VipMatcher::from_entries(vec![(vip_ip, Protocol::Tcp, 443, pool_id.clone())]);
 
     let backends: Vec<Backend> = (0..10)
         .map(|i| Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, i + 1)), 443))
@@ -209,12 +210,15 @@ fn bench_full_pipeline(c: &mut Criterion) {
 
     c.bench_function("full_pipeline_per_packet", |b| {
         b.iter(|| {
-            let mut conn_table = ConnTable::new(65536, ConnTtls::with_established(Duration::from_secs(60)));
+            let mut conn_table =
+                ConnTable::new(65536, ConnTtls::with_established(Duration::from_secs(60)));
             let now = Instant::now();
 
             for pkt in &packets {
                 let meta = PacketMeta::from_ipv4_bytes(pkt.as_slice()).unwrap();
-                let matched_pool = vip_matcher.match_packet(meta.dst_ip, meta.protocol, meta.dst_port).unwrap();
+                let matched_pool = vip_matcher
+                    .match_packet(meta.dst_ip, meta.protocol, meta.dst_port)
+                    .unwrap();
                 let flow_hash = meta.flow_hash();
                 let proto = FlowProto::from(meta.protocol);
                 let backend_ip = if let Some(cached) = conn_table.get(flow_hash, now) {
@@ -245,10 +249,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
 fn bench_conn_table_tcp_transitions(c: &mut Criterion) {
     pin_to_core();
     let now = Instant::now();
-    let mut table = ConnTable::new(
-        65536,
-        ConnTtls::with_established(Duration::from_secs(60)),
-    );
+    let mut table = ConnTable::new(65536, ConnTtls::with_established(Duration::from_secs(60)));
     // Pre-populate with Established entries so every transition targets a
     // real slot — reflects the steady-state cost in production.
     for i in 0..10_000u64 {
@@ -287,7 +288,10 @@ fn bench_conn_table_mixed_protocol(c: &mut Criterion) {
     let capacity: usize = 65536;
     let fill = capacity * 70 / 100;
 
-    let mut table = ConnTable::new(capacity, ConnTtls::with_established(Duration::from_secs(60)));
+    let mut table = ConnTable::new(
+        capacity,
+        ConnTtls::with_established(Duration::from_secs(60)),
+    );
     for i in 0..fill as u64 {
         let proto = match i % 3 {
             0 => FlowProto::Tcp,
@@ -505,7 +509,11 @@ fn bench_rewriter_to_muxer_hop(c: &mut Criterion) {
     let encapped_packets: Vec<PacketBuf> = (0..1000u16)
         .map(|i| {
             let mut pkt = build_tcp_packet_to_vip((i / 256) as u8 + 1, 10000 + i);
-            gre::encapsulate_ipv4(&mut pkt, Ipv4Addr::new(172, 16, 0, 1), Ipv4Addr::new(10, 0, 0, 1));
+            gre::encapsulate_ipv4(
+                &mut pkt,
+                Ipv4Addr::new(172, 16, 0, 1),
+                Ipv4Addr::new(10, 0, 0, 1),
+            );
             pkt
         })
         .collect();
@@ -577,11 +585,12 @@ fn make_shared_state() -> (
     let lookup_table = LookupTable::build(&backends, lb_hashing::DEFAULT_TABLE_SIZE).unwrap();
 
     let mut tables = HashMap::new();
-    tables.insert(pool_id.clone(), Arc::new(ArcSwap::from_pointee(lookup_table)));
+    tables.insert(
+        pool_id.clone(),
+        Arc::new(ArcSwap::from_pointee(lookup_table)),
+    );
 
-    let vip_matcher = VipMatcher::from_entries(vec![
-        (vip_ip, Protocol::Tcp, 443, pool_id),
-    ]);
+    let vip_matcher = VipMatcher::from_entries(vec![(vip_ip, Protocol::Tcp, 443, pool_id)]);
 
     (tables, vip_matcher)
 }
@@ -631,7 +640,10 @@ fn bench_thread_to_thread_mutex(c: &mut Criterion) {
 
                 // Start forwarder (includes pool allocation) BEFORE timing
                 let forwarder = MultiThreadedForwarder::start(
-                    rx_io, tx_io, config, 2,
+                    rx_io,
+                    tx_io,
+                    config,
+                    2,
                     ForwarderSharedState {
                         lookup_tables: tables.clone(),
                         vip_matcher: Arc::new(ArcSwap::from_pointee(vip_matcher.clone())),
@@ -688,7 +700,10 @@ fn bench_thread_to_thread_lockfree(c: &mut Criterion) {
 
                 // Start forwarder (includes pool allocation) BEFORE timing
                 let forwarder = MultiThreadedForwarder::start(
-                    rx_io, tx_io, config, 2,
+                    rx_io,
+                    tx_io,
+                    config,
+                    2,
                     ForwarderSharedState {
                         lookup_tables: tables.clone(),
                         vip_matcher: Arc::new(ArcSwap::from_pointee(vip_matcher.clone())),
@@ -792,9 +807,7 @@ fn bench_icmp_generation(c: &mut Criterion) {
     c.bench_function("icmp_frag_needed_generation", |b| {
         b.iter(|| {
             black_box(lb_forwarder::icmp::generate_icmp_frag_needed(
-                &oversized,
-                vip,
-                1476,
+                &oversized, vip, 1476,
             ));
         })
     });
@@ -805,13 +818,10 @@ fn bench_icmp_generation(c: &mut Criterion) {
             || lb_forwarder::icmp::IcmpRateLimiter::new(u32::MAX),
             |mut limiter| {
                 let now = Instant::now();
-                if lb_forwarder::icmp::should_generate_icmp(&oversized, 1500)
-                    && limiter.allow(now)
+                if lb_forwarder::icmp::should_generate_icmp(&oversized, 1500) && limiter.allow(now)
                 {
                     black_box(lb_forwarder::icmp::generate_icmp_frag_needed(
-                        &oversized,
-                        vip,
-                        1476,
+                        &oversized, vip, 1476,
                     ));
                 }
             },

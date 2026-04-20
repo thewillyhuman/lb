@@ -18,7 +18,12 @@ fn pin_to_core() {
 
 fn make_backends(n: usize) -> Vec<Backend> {
     (0..n)
-        .map(|i| Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)), 443))
+        .map(|i| {
+            Backend::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+                443,
+            )
+        })
         .collect()
 }
 
@@ -72,10 +77,7 @@ fn bench_cascading_rebuild(c: &mut Criterion) {
                     .map(|b| {
                         let ip_third = ((pool_idx * 19 + b) / 256) as u8;
                         let ip_fourth = ((pool_idx * 19 + b) % 256) as u8;
-                        Backend::new(
-                            IpAddr::V4(Ipv4Addr::new(10, ip_third, ip_fourth, 1)),
-                            443,
-                        )
+                        Backend::new(IpAddr::V4(Ipv4Addr::new(10, ip_third, ip_fourth, 1)), 443)
                     })
                     .collect();
                 // Shared backend that appears in every pool (the one that flaps)
@@ -100,9 +102,7 @@ fn bench_cascading_rebuild(c: &mut Criterion) {
                             .filter(|b| b.ip != IpAddr::V4(Ipv4Addr::new(10, 255, 255, 1)))
                             .collect();
                         let owned: Vec<Backend> = healthy.into_iter().cloned().collect();
-                        black_box(
-                            LookupTable::build(&owned, DEFAULT_TABLE_SIZE).unwrap(),
-                        );
+                        black_box(LookupTable::build(&owned, DEFAULT_TABLE_SIZE).unwrap());
                     }
                 })
             },
@@ -130,9 +130,7 @@ fn bench_cascading_rebuild(c: &mut Criterion) {
                             .filter(|b| b.ip != flapping_ip)
                             .cloned()
                             .collect();
-                        black_box(
-                            LookupTable::build(&healthy, DEFAULT_TABLE_SIZE).unwrap(),
-                        );
+                        black_box(LookupTable::build(&healthy, DEFAULT_TABLE_SIZE).unwrap());
                     }
                 })
             },
@@ -153,9 +151,7 @@ fn bench_table_build_scaling(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("backends", n_backends),
             &n_backends,
-            |b, _| {
-                b.iter(|| LookupTable::build(black_box(&backends), DEFAULT_TABLE_SIZE).unwrap())
-            },
+            |b, _| b.iter(|| LookupTable::build(black_box(&backends), DEFAULT_TABLE_SIZE).unwrap()),
         );
     }
 

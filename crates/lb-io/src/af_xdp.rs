@@ -85,9 +85,7 @@ mod inner {
             }
 
             // Create AF_XDP socket
-            let socket_fd = unsafe {
-                libc::socket(libc::AF_XDP, libc::SOCK_RAW, 0)
-            };
+            let socket_fd = unsafe { libc::socket(libc::AF_XDP, libc::SOCK_RAW, 0) };
 
             if socket_fd < 0 {
                 unsafe { libc::munmap(umem_area, umem_size) };
@@ -157,9 +155,8 @@ mod inner {
                 }
 
                 let len = n as usize;
-                slot.data[..len].copy_from_slice(unsafe {
-                    std::slice::from_raw_parts(frame_ptr, len)
-                });
+                slot.data[..len]
+                    .copy_from_slice(unsafe { std::slice::from_raw_parts(frame_ptr, len) });
                 slot.len = len;
                 received += 1;
             }
@@ -185,11 +182,7 @@ mod inner {
 
                 // Copy packet to UMEM frame
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        pkt.data.as_ptr(),
-                        frame_ptr,
-                        pkt.len,
-                    );
+                    std::ptr::copy_nonoverlapping(pkt.data.as_ptr(), frame_ptr, pkt.len);
                 }
 
                 let n = unsafe {
@@ -282,11 +275,17 @@ mod stub {
 
     impl PacketIo for AfXdpIo {
         fn recv_batch(&mut self, _buf: &mut [PacketBuf]) -> io::Result<usize> {
-            Err(io::Error::new(io::ErrorKind::Unsupported, "AF_XDP not available"))
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "AF_XDP not available",
+            ))
         }
 
         fn send_batch(&mut self, _buf: &[PacketBuf]) -> io::Result<usize> {
-            Err(io::Error::new(io::ErrorKind::Unsupported, "AF_XDP not available"))
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "AF_XDP not available",
+            ))
         }
     }
 }

@@ -220,10 +220,7 @@ impl PeerSessionCtx {
 
     async fn run(self, mut rx: mpsc::UnboundedReceiver<SessionCmd>) {
         let mut backoff = RECONNECT_BACKOFF_MIN;
-        let hold_time = self
-            .peer
-            .hold_time_secs
-            .unwrap_or(DEFAULT_HOLD_TIME_SECS);
+        let hold_time = self.peer.hold_time_secs.unwrap_or(DEFAULT_HOLD_TIME_SECS);
         let keepalive_interval = Duration::from_secs((hold_time / 3).max(1) as u64);
 
         loop {
@@ -448,10 +445,7 @@ mod tests {
     /// Accept one BGP handshake and record every subsequent UPDATE body.
     /// Returns all bytes read after the handshake. Stops reading when either
     /// the stop signal arrives or the peer closes the connection.
-    async fn mock_peer(
-        listener: TcpListener,
-        mut stop: oneshot::Receiver<()>,
-    ) -> Vec<u8> {
+    async fn mock_peer(listener: TcpListener, mut stop: oneshot::Receiver<()>) -> Vec<u8> {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut buf = vec![0u8; 4096];
 
@@ -545,8 +539,14 @@ mod tests {
         let captured_a = h_a.await.unwrap();
         let captured_b = h_b.await.unwrap();
 
-        assert!(contains_update_with_nlri(&captured_a, vip), "peer A missed UPDATE: {captured_a:?}");
-        assert!(contains_update_with_nlri(&captured_b, vip), "peer B missed UPDATE: {captured_b:?}");
+        assert!(
+            contains_update_with_nlri(&captured_a, vip),
+            "peer A missed UPDATE: {captured_a:?}"
+        );
+        assert!(
+            contains_update_with_nlri(&captured_b, vip),
+            "peer B missed UPDATE: {captured_b:?}"
+        );
     }
 
     #[tokio::test]
@@ -575,7 +575,10 @@ mod tests {
         speaker.shutdown().await;
 
         let captured_b = h_b.await.unwrap();
-        assert!(contains_update_with_nlri(&captured_b, vip), "peer B missed UPDATE despite peer A being down");
+        assert!(
+            contains_update_with_nlri(&captured_b, vip),
+            "peer B missed UPDATE despite peer A being down"
+        );
     }
 
     #[tokio::test]

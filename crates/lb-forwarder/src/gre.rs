@@ -17,11 +17,7 @@ const GRE_PROTO_IPV6: u16 = 0x86DD;
 ///
 /// The packet data is shifted right by ENCAP_OVERHEAD bytes to make room
 /// for the outer headers. Returns false if the packet doesn't fit.
-pub fn encapsulate_ipv4(
-    pkt: &mut PacketBuf,
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
-) -> bool {
+pub fn encapsulate_ipv4(pkt: &mut PacketBuf, src_ip: Ipv4Addr, dst_ip: Ipv4Addr) -> bool {
     match encapsulate_ipv4_buf(&mut pkt.data, pkt.len, src_ip, dst_ip) {
         Some(new_len) => {
             pkt.len = new_len;

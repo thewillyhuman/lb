@@ -206,11 +206,7 @@ async fn handle_connection(
     }
 
     // Reply with our OPEN + KEEPALIVE.
-    let reply = messages::encode_open(
-        65000,
-        opts.our_hold_time_secs,
-        Ipv4Addr::new(10, 0, 0, 254),
-    );
+    let reply = messages::encode_open(65000, opts.our_hold_time_secs, Ipv4Addr::new(10, 0, 0, 254));
     if stream.write_all(&reply).await.is_err() {
         return;
     }

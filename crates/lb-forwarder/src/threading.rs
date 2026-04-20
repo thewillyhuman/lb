@@ -12,8 +12,8 @@
 //! After the muxer sends a frame, it returns the index to the completion queue
 //! so steering can reuse it. This mirrors AF_XDP's UMEM model.
 
-use crate::gre;
 use crate::conn_table::{ConnTable, InsertResult};
+use crate::gre;
 use crate::packet_pool::{FrameIndex, PacketPool};
 use crate::steering;
 use crate::vip_matcher::VipMatcher;
@@ -290,7 +290,8 @@ fn run_rewriter(ctx: RewriterContext, shutdown: &AtomicBool) {
             };
 
             // VIP match
-            let pool_id = match vip_matcher.match_packet(meta.dst_ip, meta.protocol, meta.dst_port) {
+            let pool_id = match vip_matcher.match_packet(meta.dst_ip, meta.protocol, meta.dst_port)
+            {
                 Some(id) => id,
                 None => {
                     ctx.metrics.packets_dropped.inc();
@@ -369,7 +370,9 @@ fn run_rewriter(ctx: RewriterContext, shutdown: &AtomicBool) {
             };
 
             // GRE encapsulation in-place on the pool frame (zero-copy)
-            if let Some(new_len) = gre::encapsulate_ipv4_buf(&mut frame.data, frame.len, src_ipv4, dst_ipv4) {
+            if let Some(new_len) =
+                gre::encapsulate_ipv4_buf(&mut frame.data, frame.len, src_ipv4, dst_ipv4)
+            {
                 frame.len = new_len;
                 ctx.metrics.packets_forwarded.inc();
                 // Push index to TX queue; free if full
@@ -637,9 +640,7 @@ mod tests {
         let (rx_io, rx_handle) = mock_io();
         let (tx_io, tx_handle) = mock_io();
 
-        let backends = vec![
-            Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443),
-        ];
+        let backends = vec![Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443)];
 
         let lookup_table = LookupTable::build(&backends, 17).unwrap();
         let pool_id = BackendPoolId("web".into());
@@ -702,7 +703,11 @@ mod tests {
             let dst = &pkt[16..20];
             dst_ips.insert([dst[0], dst[1], dst[2], dst[3]]);
         }
-        assert_eq!(dst_ips.len(), 1, "all same-flow packets should go to same backend");
+        assert_eq!(
+            dst_ips.len(),
+            1,
+            "all same-flow packets should go to same backend"
+        );
 
         forwarder.shutdown();
     }

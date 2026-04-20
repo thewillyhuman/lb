@@ -43,10 +43,7 @@ impl<P: Probe + 'static> HealthChecker<P> {
 
     /// Start health checking all given backends. Returns a receiver that gets notified
     /// on any health status change as `(IpAddr, HealthStatus)`.
-    pub fn start(
-        &self,
-        backends: Vec<Backend>,
-    ) -> watch::Receiver<HashMap<IpAddr, HealthStatus>> {
+    pub fn start(&self, backends: Vec<Backend>) -> watch::Receiver<HashMap<IpAddr, HealthStatus>> {
         let (tx, rx) = watch::channel(HashMap::new());
 
         // Deduplicate by (ip, port)

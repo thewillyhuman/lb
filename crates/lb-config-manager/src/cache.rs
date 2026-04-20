@@ -42,10 +42,7 @@ mod tests {
             }],
             pools: vec![BackendPool {
                 id: BackendPoolId("pool".into()),
-                backends: vec![Backend::new(
-                    IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-                    443,
-                )],
+                backends: vec![Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 443)],
                 health_check: None,
             }],
         };

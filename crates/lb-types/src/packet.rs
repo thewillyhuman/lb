@@ -284,12 +284,7 @@ pub fn is_non_first_fragment(data: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    fn build_ipv4_tcp_packet(
-        src: [u8; 4],
-        dst: [u8; 4],
-        src_port: u16,
-        dst_port: u16,
-    ) -> Vec<u8> {
+    fn build_ipv4_tcp_packet(src: [u8; 4], dst: [u8; 4], src_port: u16, dst_port: u16) -> Vec<u8> {
         let mut pkt = vec![0u8; 40]; // 20 IP + 20 TCP
         pkt[0] = 0x45; // version=4, IHL=5
         pkt[9] = 6; // TCP
@@ -360,7 +355,12 @@ mod tests {
         assert!(is_non_first_fragment(&pkt));
     }
 
-    fn build_ipv6_tcp_packet(src: [u16; 8], dst: [u16; 8], src_port: u16, dst_port: u16) -> Vec<u8> {
+    fn build_ipv6_tcp_packet(
+        src: [u16; 8],
+        dst: [u16; 8],
+        src_port: u16,
+        dst_port: u16,
+    ) -> Vec<u8> {
         let mut pkt = vec![0u8; 60]; // 40 IPv6 header + 20 TCP
         pkt[0] = 0x60; // version=6
         pkt[4..6].copy_from_slice(&20u16.to_be_bytes()); // payload length
@@ -427,7 +427,10 @@ mod tests {
     fn tcp_flags_extracted_from_syn_ack() {
         let mut pkt = build_ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], 1, 443);
         pkt[33] = 0x12; // SYN + ACK
-        let flags = PacketMeta::from_ipv4_bytes(&pkt).unwrap().tcp_flags.unwrap();
+        let flags = PacketMeta::from_ipv4_bytes(&pkt)
+            .unwrap()
+            .tcp_flags
+            .unwrap();
         assert!(flags.syn());
         assert!(flags.ack());
     }
@@ -436,7 +439,10 @@ mod tests {
     fn tcp_flags_extracted_from_fin() {
         let mut pkt = build_ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], 1, 443);
         pkt[33] = 0x11; // FIN + ACK
-        let flags = PacketMeta::from_ipv4_bytes(&pkt).unwrap().tcp_flags.unwrap();
+        let flags = PacketMeta::from_ipv4_bytes(&pkt)
+            .unwrap()
+            .tcp_flags
+            .unwrap();
         assert!(flags.fin());
         assert!(flags.ack());
     }
@@ -445,7 +451,10 @@ mod tests {
     fn tcp_flags_extracted_from_rst() {
         let mut pkt = build_ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], 1, 443);
         pkt[33] = 0x04; // RST
-        let flags = PacketMeta::from_ipv4_bytes(&pkt).unwrap().tcp_flags.unwrap();
+        let flags = PacketMeta::from_ipv4_bytes(&pkt)
+            .unwrap()
+            .tcp_flags
+            .unwrap();
         assert!(flags.rst());
         assert!(!flags.ack());
     }
