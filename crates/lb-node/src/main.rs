@@ -132,7 +132,11 @@ fn main() {
     let mut bgp_speaker = BgpSpeaker::new(config.bgp.clone());
     let bgp_events = bgp_speaker.take_event_rx();
     bgp_speaker.spawn(bgp_runtime.handle());
-    let bgp_announcer: Arc<dyn BgpAnnouncer> = Arc::new(bgp_speaker);
+    // Keep a concrete `Arc<BgpSpeaker>` so the signal handler can call
+    // `shutdown`; the controller holds the same data through the trait object
+    // via an unsizing coercion (`Arc<BgpSpeaker>` → `Arc<dyn BgpAnnouncer>`).
+    let bgp_speaker: Arc<BgpSpeaker> = Arc::new(bgp_speaker);
+    let bgp_announcer: Arc<dyn BgpAnnouncer> = bgp_speaker.clone();
 
     // Controller
     let mut controller = Controller::new(
@@ -307,8 +311,48 @@ fn main() {
 
     tracing::info!("lb-node started");
 
-    // Main thread: wait for forwarder to finish (or panic)
-    // In production, this would also handle signal handling (SIGTERM, SIGHUP).
+    // Graceful shutdown: on SIGTERM or SIGINT, withdraw every announced VIP
+    // (so the upstream router removes us from ECMP *before* we stop
+    // forwarding, not after its BGP hold timer has elapsed), then tear down
+    // BGP sessions, then join the forwarder threads. Exiting without
+    // withdrawing would cause a ~90-second traffic blackhole at the router.
+    {
+        let controller_for_signal = Arc::clone(&controller);
+        let bgp_speaker_for_signal = Arc::clone(&bgp_speaker);
+        let forwarder_for_signal = Arc::clone(&forwarder);
+        bgp_handle.spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+            let signame = tokio::select! {
+                _ = sigterm.recv() => "SIGTERM",
+                _ = sigint.recv() => "SIGINT",
+            };
+            tracing::info!(%signame, "received shutdown signal, draining");
+
+            // 1. Withdraw VIPs. Best-effort; the speaker writes to each peer
+            //    session's mpsc channel and returns immediately.
+            controller_for_signal.lock().withdraw_all();
+
+            // 2. Give BGP peers a brief moment to receive and ACK the
+            //    UPDATEs. 2s is plenty on a healthy network.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            // 3. Close BGP sessions. Each session sees a `Shutdown` command,
+            //    drops its TCP stream, and the JoinHandle resolves.
+            bgp_speaker_for_signal.shutdown().await;
+
+            // 4. Join forwarder threads.
+            forwarder_for_signal.shutdown();
+
+            tracing::info!("shutdown complete");
+            std::process::exit(0);
+        });
+    }
+
+    // Main thread: wait for forwarder to finish (or panic). The signal handler
+    // calls `std::process::exit` directly on graceful shutdown, so we only
+    // reach the `exit(1)` branch on an *unexpected* thread panic.
     loop {
         if !forwarder.is_running() {
             tracing::error!("forwarder thread(s) exited unexpectedly");

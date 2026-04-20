@@ -11,6 +11,7 @@ lb-io = { workspace = true }
 lb-metrics = { workspace = true }
 arc-swap = { workspace = true }
 dashmap = { workspace = true }
+parking_lot = { workspace = true }
 xxhash-rust = { workspace = true }
 crossbeam = { workspace = true }
 tracing = { workspace = true }

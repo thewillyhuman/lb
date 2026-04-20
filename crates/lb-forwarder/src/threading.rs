@@ -58,7 +58,11 @@ pub struct ForwarderSharedState {
 
 /// Multi-threaded forwarder engine.
 pub struct MultiThreadedForwarder {
-    handles: Vec<JoinHandle<()>>,
+    /// Thread handles wrapped in a Mutex so `shutdown` can `join` them from
+    /// `&self`, letting the forwarder live behind `Arc` (e.g. when a signal
+    /// handler needs to drive shutdown alongside other owners like the ops
+    /// HTTP server's liveness check).
+    handles: parking_lot::Mutex<Vec<JoinHandle<()>>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -165,20 +169,28 @@ impl MultiThreadedForwarder {
             );
         }
 
-        Self { handles, shutdown }
+        Self {
+            handles: parking_lot::Mutex::new(handles),
+            shutdown,
+        }
     }
 
     /// Signal all threads to shut down and wait for them to finish.
-    pub fn shutdown(self) {
+    ///
+    /// Idempotent: calling twice is a no-op (the second call finds an empty
+    /// handles vec). Blocks until every worker thread has joined.
+    pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        for handle in self.handles {
+        let handles = std::mem::take(&mut *self.handles.lock());
+        for handle in handles {
             let _ = handle.join();
         }
     }
 
     /// Check if the forwarder is still running (no thread has panicked).
     pub fn is_running(&self) -> bool {
-        self.handles.iter().all(|h| !h.is_finished())
+        let handles = self.handles.lock();
+        !handles.is_empty() && handles.iter().all(|h| !h.is_finished())
     }
 }
 
