@@ -65,8 +65,24 @@ fn main() {
         return;
     }
 
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Initialize tracing. Default to the JSON formatter — structured logs
+    // round-trip cleanly through `journald` → `journalctl -o cat` / `jq` /
+    // Loki, and the per-call `tracing::info!(field = %value, "msg")` sites
+    // already scattered through the binary all become first-class indexable
+    // fields. Operators who prefer pretty console output for local dev can
+    // set `LB_LOG_FORMAT=pretty`. Log level is driven by `RUST_LOG` as
+    // usual, defaulting to `info`.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    match std::env::var("LB_LOG_FORMAT").as_deref() {
+        Ok("pretty") => tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .init(),
+        _ => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .init(),
+    }
 
     tracing::info!(
         node_id = %config.node.id,
