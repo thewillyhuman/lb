@@ -11,7 +11,7 @@ A high-performance L4 packet-forwarding load balancer written in Rust, inspired 
 - **Kernel bypass I/O** -- AF_XDP and DPDK backends for line-rate packet processing on commodity hardware
 - **Multi-threaded data plane** -- steering thread distributes to per-rewriter SPSC queues; muxer thread collects TX output. Zero-copy hot path: packets live in a shared `PacketPool` arena, only 4-byte frame indices flow through queues (AF_XDP UMEM model)
 - **Health checking** -- TCP, HTTP, and HTTPS probes with configurable thresholds and state machine (UNKNOWN/HEALTHY/UNHEALTHY)
-- **BGP speaker** -- minimal custom implementation (OPEN/UPDATE/KEEPALIVE/NOTIFICATION) for VIP announcement and withdrawal
+- **BGP speaker** -- minimal custom implementation (OPEN/UPDATE/KEEPALIVE/NOTIFICATION) with active-active announcement to multiple router peers. Each peer holds an independent session with exponential-backoff reconnect (1s→60s); VIPs fan out to every Established peer so loss of any single router does not withdraw the VIP from the others. Driven by the controller: a VIP is announced while at least one backend in its pool is healthy and withdrawn otherwise
 - **File-based config** -- LB config (VIPs + pools) loaded from a local JSON file, watched via inotify, reloaded atomically ([ADR-001](.docs/adr-001-configuration-model.md))
 - **Debounced health rebuilds** -- correlated failures (rack switch dies) are coalesced into a single Maglev table rebuild per affected pool via a 50ms accumulation window
 - **Atomic config reload** -- lookup tables and VIP matcher swapped via `ArcSwap`; in-flight packets are never dropped

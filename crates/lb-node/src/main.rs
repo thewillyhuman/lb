@@ -1,4 +1,5 @@
 use clap::Parser;
+use lb_bgp::{BgpAnnouncer, BgpEvent, BgpSpeaker};
 use lb_config_manager::loader::LbConfig;
 use lb_config_manager::watcher::ConfigWatcher;
 use lb_controller::Controller;
@@ -7,7 +8,7 @@ use lb_forwarder::vip_matcher::VipMatcher;
 use lb_forwarder::ForwarderConfig;
 use lb_hashing::LookupTable;
 use lb_io::mock::mock_io;
-use lb_metrics::LbMetrics;
+use lb_metrics::{LbMetrics, PeerLabels};
 use lb_types::{BackendPoolId, HealthStatus, NodeConfig};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -111,6 +112,20 @@ fn main() {
         );
     }
 
+    // BGP speaker — one session per configured peer. Spawned on a dedicated
+    // tokio runtime so the sync control-plane thread can use `announce` /
+    // `withdraw` without needing to be async itself.
+    let bgp_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("lb-bgp")
+        .enable_all()
+        .build()
+        .expect("failed to build BGP runtime");
+    let mut bgp_speaker = BgpSpeaker::new(config.bgp.clone());
+    let bgp_events = bgp_speaker.take_event_rx();
+    bgp_speaker.spawn(bgp_runtime.handle());
+    let bgp_announcer: Arc<dyn BgpAnnouncer> = Arc::new(bgp_speaker);
+
     // Controller
     let mut controller = Controller::new(
         lookup_tables.clone(),
@@ -120,11 +135,65 @@ fn main() {
     if let Some(parent) = config.control_plane.local_cache.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    controller = controller.with_cache_path(config.control_plane.local_cache.clone());
+    controller = controller
+        .with_cache_path(config.control_plane.local_cache.clone())
+        .with_bgp(Arc::clone(&bgp_announcer));
 
     if let Some((_, ref lb_config)) = initial_lb_config {
         controller.apply_config(lb_config.clone());
     }
+
+    // BGP event pump: drive per-peer metrics and re-announce the full VIP
+    // set whenever a peer (re)connects. Controller is wrapped in Arc<Mutex>
+    // for the event loop. We use a blocking Mutex because event bursts are
+    // infrequent and the critical section is tiny (flip a set of VIPs).
+    let controller = Arc::new(parking_lot::Mutex::new(controller));
+    if let Some(mut rx) = bgp_events {
+        let controller_for_events = Arc::clone(&controller);
+        let bgp_metrics = metrics.controller.bgp.clone();
+        bgp_runtime.spawn(async move {
+            while let Some(evt) = rx.recv().await {
+                match evt {
+                    BgpEvent::PeerConnected { peer_ip } => {
+                        let labels = PeerLabels {
+                            peer_ip: peer_ip.to_string(),
+                        };
+                        bgp_metrics.peer_state.get_or_create(&labels).set(1);
+                        bgp_metrics.peer_connects.get_or_create(&labels).inc();
+                        // Push the full announced-set to the newly-connected peer
+                        // to recover any updates dropped while it was down.
+                        controller_for_events.lock().reannounce_all();
+                    }
+                    BgpEvent::PeerDisconnected { peer_ip, reason } => {
+                        let labels = PeerLabels {
+                            peer_ip: peer_ip.to_string(),
+                        };
+                        bgp_metrics.peer_state.get_or_create(&labels).set(0);
+                        bgp_metrics.peer_disconnects.get_or_create(&labels).inc();
+                        tracing::info!(%peer_ip, %reason, "BGP peer disconnected");
+                    }
+                    BgpEvent::AnnounceFailed { peer_ip } => {
+                        bgp_metrics
+                            .announce_failures
+                            .get_or_create(&PeerLabels {
+                                peer_ip: peer_ip.to_string(),
+                            })
+                            .inc();
+                    }
+                    BgpEvent::WithdrawFailed { peer_ip } => {
+                        bgp_metrics
+                            .withdraw_failures
+                            .get_or_create(&PeerLabels {
+                                peer_ip: peer_ip.to_string(),
+                            })
+                            .inc();
+                    }
+                }
+            }
+        });
+    }
+    // Retain the runtime for the lifetime of the process.
+    std::mem::forget(bgp_runtime);
 
     // Forwarder config
     let mtu_config = lb_types::MtuConfig::new(config.forwarder.network_mtu).unwrap_or_else(|e| {

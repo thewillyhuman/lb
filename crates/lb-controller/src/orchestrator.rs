@@ -1,10 +1,11 @@
+use lb_bgp::BgpAnnouncer;
 use lb_config_manager::applier;
 use lb_config_manager::cache;
 use lb_config_manager::loader::LbConfig;
 use lb_hashing::LookupTable;
 use lb_types::{BackendPoolId, HealthStatus};
-use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,6 +39,14 @@ pub struct Controller {
     cache_path: Option<PathBuf>,
     /// Maglev table size.
     table_size: usize,
+    /// Optional BGP announcer. When set, the controller keeps the set of
+    /// announced VIPs in sync with the set of VIPs whose backing pool has at
+    /// least one healthy backend.
+    bgp: Option<Arc<dyn BgpAnnouncer>>,
+    /// VIPs the controller believes are currently announced. Used to compute
+    /// announce/withdraw diffs on health or config changes. Only IPv4 VIPs
+    /// are tracked — IPv6 BGP announcement is out of scope.
+    vips_announced: BTreeSet<Ipv4Addr>,
 }
 
 impl Controller {
@@ -55,12 +64,35 @@ impl Controller {
             pending_since: None,
             cache_path: None,
             table_size,
+            bgp: None,
+            vips_announced: BTreeSet::new(),
         }
     }
 
     pub fn with_cache_path(mut self, path: PathBuf) -> Self {
         self.cache_path = Some(path);
         self
+    }
+
+    /// Attach a BGP announcer. Every subsequent config or health change will
+    /// diff the set of VIPs-with-healthy-pool against `vips_announced` and
+    /// call `announce`/`withdraw` accordingly.
+    pub fn with_bgp(mut self, bgp: Arc<dyn BgpAnnouncer>) -> Self {
+        self.bgp = Some(bgp);
+        self
+    }
+
+    /// Re-announce every VIP in the current desired set. Call after the BGP
+    /// speaker reports a peer has (re)connected, so that peer gets the full
+    /// announcement state even if individual commands were dropped while it
+    /// was down.
+    pub fn reannounce_all(&self) {
+        if let Some(bgp) = &self.bgp {
+            let vips: Vec<Ipv4Addr> = self.vips_announced.iter().copied().collect();
+            if !vips.is_empty() {
+                bgp.announce(&vips);
+            }
+        }
     }
 
     /// Apply a new configuration. Rebuilds all lookup tables and swaps them atomically.
@@ -95,7 +127,78 @@ impl Controller {
         }
 
         self.config = Some(config);
+
+        // Recompute announced VIP set from the fresh config + health state.
+        self.sync_bgp_announcements();
+
         tracing::info!("config applied successfully");
+    }
+
+    /// Compute the set of VIPs that currently have at least one healthy
+    /// backend in their pool. Only IPv4 VIPs are considered for BGP.
+    fn desired_announced_vips(&self) -> BTreeSet<Ipv4Addr> {
+        let Some(config) = &self.config else {
+            return BTreeSet::new();
+        };
+
+        // Map pool id -> has_any_healthy_backend.
+        let mut pool_healthy: HashMap<&BackendPoolId, bool> = HashMap::new();
+        for pool in &config.pools {
+            let any_healthy = pool.backends.iter().any(|b| {
+                self.health_status
+                    .get(&b.ip)
+                    .map(|s| *s != HealthStatus::Unhealthy)
+                    .unwrap_or(true) // unknown == healthy-by-default (matches rewriter)
+            });
+            pool_healthy.insert(&pool.id, any_healthy);
+        }
+
+        let mut out = BTreeSet::new();
+        for vip in &config.vips {
+            let IpAddr::V4(v4) = vip.address else { continue };
+            let any_service_healthy = vip.services.iter().any(|svc| {
+                pool_healthy
+                    .get(&BackendPoolId(svc.backend_pool.clone()))
+                    .copied()
+                    .unwrap_or(false)
+            });
+            if any_service_healthy {
+                out.insert(v4);
+            }
+        }
+        out
+    }
+
+    /// Diff desired VIPs against currently-announced VIPs and emit
+    /// announce/withdraw calls to the BGP speaker. No-op if no BGP speaker
+    /// is attached.
+    fn sync_bgp_announcements(&mut self) {
+        let Some(bgp) = &self.bgp else {
+            return;
+        };
+
+        let desired = self.desired_announced_vips();
+
+        let to_announce: Vec<Ipv4Addr> = desired
+            .difference(&self.vips_announced)
+            .copied()
+            .collect();
+        let to_withdraw: Vec<Ipv4Addr> = self
+            .vips_announced
+            .difference(&desired)
+            .copied()
+            .collect();
+
+        if !to_announce.is_empty() {
+            tracing::info!(count = to_announce.len(), "announcing VIPs");
+            bgp.announce(&to_announce);
+        }
+        if !to_withdraw.is_empty() {
+            tracing::info!(count = to_withdraw.len(), "withdrawing VIPs");
+            bgp.withdraw(&to_withdraw);
+        }
+
+        self.vips_announced = desired;
     }
 
     /// Record a backend health status change.
@@ -124,7 +227,13 @@ impl Controller {
             }
         }
 
-        // Flush if the debounce window has elapsed
+        // BGP announcements are reconciled eagerly (not debounced): a VIP
+        // with zero healthy backends must be withdrawn immediately so the
+        // router stops sending it traffic. The announced-set is small, so
+        // recomputing on every health event is cheap.
+        self.sync_bgp_announcements();
+
+        // Flush lookup-table rebuilds if the debounce window has elapsed.
         self.maybe_flush();
     }
 
@@ -482,6 +591,225 @@ mod tests {
         assert!(!controller.has_pending_rebuilds());
         // apply_config rebuilt with current health, so 10.0.0.2 is excluded
         assert_eq!(tables[&pool_id].load().num_backends(), 1);
+    }
+
+    /// In-memory BGP announcer that records every call. Lets us test the
+    /// controller's VIP-diff logic without touching real TCP sockets.
+    #[derive(Default)]
+    struct MockAnnouncer {
+        events: parking_lot::Mutex<Vec<AnnouncerEvent>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum AnnouncerEvent {
+        Announce(Vec<Ipv4Addr>),
+        Withdraw(Vec<Ipv4Addr>),
+    }
+
+    impl BgpAnnouncer for MockAnnouncer {
+        fn announce(&self, vips: &[Ipv4Addr]) {
+            self.events
+                .lock()
+                .push(AnnouncerEvent::Announce(vips.to_vec()));
+        }
+        fn withdraw(&self, vips: &[Ipv4Addr]) {
+            self.events
+                .lock()
+                .push(AnnouncerEvent::Withdraw(vips.to_vec()));
+        }
+    }
+
+    impl MockAnnouncer {
+        fn drain(&self) -> Vec<AnnouncerEvent> {
+            std::mem::take(&mut *self.events.lock())
+        }
+    }
+
+    fn vip_v4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
+        Ipv4Addr::new(a, b, c, d)
+    }
+
+    fn make_bgp_config() -> (LbConfig, Ipv4Addr, Ipv4Addr) {
+        let vip_a = vip_v4(188, 184, 100, 10);
+        let vip_b = vip_v4(188, 184, 100, 11);
+        let cfg = LbConfig {
+            vips: vec![
+                Vip {
+                    id: VipId("web".into()),
+                    address: IpAddr::V4(vip_a),
+                    services: vec![VipService {
+                        protocol: Protocol::Tcp,
+                        port: 443,
+                        backend_pool: "pool-a".into(),
+                    }],
+                    owner: "test".into(),
+                    description: "".into(),
+                },
+                Vip {
+                    id: VipId("api".into()),
+                    address: IpAddr::V4(vip_b),
+                    services: vec![VipService {
+                        protocol: Protocol::Tcp,
+                        port: 443,
+                        backend_pool: "pool-b".into(),
+                    }],
+                    owner: "test".into(),
+                    description: "".into(),
+                },
+            ],
+            pools: vec![
+                BackendPool {
+                    id: BackendPoolId("pool-a".into()),
+                    backends: vec![
+                        Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443),
+                        Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 443),
+                    ],
+                    health_check: None,
+                },
+                BackendPool {
+                    id: BackendPoolId("pool-b".into()),
+                    backends: vec![
+                        Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)), 443),
+                    ],
+                    health_check: None,
+                },
+            ],
+        };
+        (cfg, vip_a, vip_b)
+    }
+
+    fn setup_with_bgp() -> (Controller, Arc<MockAnnouncer>, Ipv4Addr, Ipv4Addr) {
+        let (cfg, vip_a, vip_b) = make_bgp_config();
+        let mut tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>> = HashMap::new();
+        for pool in &cfg.pools {
+            let t = LookupTable::build(&pool.backends, 17).unwrap();
+            tables.insert(pool.id.clone(), Arc::new(ArcSwap::from_pointee(t)));
+        }
+        let health = Arc::new(DashMap::new());
+        let mock = Arc::new(MockAnnouncer::default());
+        let mut ctl = Controller::new(tables, health, 17)
+            .with_bgp(mock.clone() as Arc<dyn BgpAnnouncer>);
+        ctl.apply_config(cfg);
+        (ctl, mock, vip_a, vip_b)
+    }
+
+    #[test]
+    fn apply_config_announces_vips_with_healthy_pools() {
+        let (_ctl, mock, vip_a, vip_b) = setup_with_bgp();
+
+        // Both pools have no explicit health = treated as healthy by default,
+        // so both VIPs should be announced.
+        let events = mock.drain();
+        let announced: Vec<Ipv4Addr> = events
+            .iter()
+            .filter_map(|e| match e {
+                AnnouncerEvent::Announce(v) => Some(v.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(announced.contains(&vip_a));
+        assert!(announced.contains(&vip_b));
+    }
+
+    #[test]
+    fn withdraw_when_all_pool_backends_unhealthy() {
+        let (mut ctl, mock, _vip_a, vip_b) = setup_with_bgp();
+        mock.drain(); // clear initial announcements
+
+        // pool-b has exactly one backend (10.0.1.1). Take it down.
+        ctl.on_health_change(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+            HealthStatus::Unhealthy,
+        );
+
+        let events = mock.drain();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AnnouncerEvent::Withdraw(v) if v.contains(&vip_b))),
+            "expected withdraw of {vip_b}, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn reannounce_when_pool_recovers() {
+        let (mut ctl, mock, _vip_a, vip_b) = setup_with_bgp();
+        mock.drain();
+
+        // Take down, then bring back up.
+        ctl.on_health_change(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+            HealthStatus::Unhealthy,
+        );
+        mock.drain();
+        ctl.on_health_change(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+            HealthStatus::Healthy,
+        );
+
+        let events = mock.drain();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AnnouncerEvent::Announce(v) if v.contains(&vip_b))),
+            "expected re-announce of {vip_b}, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn partially_healthy_pool_keeps_vip_announced() {
+        let (mut ctl, mock, vip_a, _) = setup_with_bgp();
+        mock.drain();
+
+        // pool-a has two backends — take only one down. The VIP must stay up.
+        ctl.on_health_change(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            HealthStatus::Unhealthy,
+        );
+
+        let events = mock.drain();
+        for e in &events {
+            if let AnnouncerEvent::Withdraw(v) = e {
+                assert!(!v.contains(&vip_a), "vip_a withdrawn too early: {events:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn apply_config_rediff_announces_only_new_vips() {
+        let (mut ctl, mock, vip_a, vip_b) = setup_with_bgp();
+        mock.drain();
+
+        // Reapply the same config — no diff, nothing should fire.
+        let (cfg, _, _) = make_bgp_config();
+        ctl.apply_config(cfg);
+
+        let events = mock.drain();
+        let any_nonempty = events.iter().any(|e| match e {
+            AnnouncerEvent::Announce(v) | AnnouncerEvent::Withdraw(v) => !v.is_empty(),
+        });
+        assert!(!any_nonempty, "reapply fired unexpected events: {events:?}");
+        // Silence unused
+        let _ = (vip_a, vip_b);
+    }
+
+    #[test]
+    fn reannounce_all_emits_full_set() {
+        let (ctl, mock, vip_a, vip_b) = setup_with_bgp();
+        mock.drain();
+
+        ctl.reannounce_all();
+
+        let events = mock.drain();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AnnouncerEvent::Announce(v) => {
+                assert!(v.contains(&vip_a));
+                assert!(v.contains(&vip_b));
+            }
+            _ => panic!("expected single Announce, got {events:?}"),
+        }
     }
 
     #[test]

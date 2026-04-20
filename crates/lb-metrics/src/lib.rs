@@ -2,7 +2,7 @@ pub mod forwarder_metrics;
 pub mod controller_metrics;
 
 pub use forwarder_metrics::ForwarderMetrics;
-pub use controller_metrics::ControllerMetrics;
+pub use controller_metrics::{BgpMetrics, ControllerMetrics, PeerLabels};
 
 use parking_lot::Mutex;
 use prometheus_client::registry::Registry;

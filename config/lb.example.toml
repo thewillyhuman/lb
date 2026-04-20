@@ -10,10 +10,24 @@ num_threads     = 7               # packet rewriter threads (leave 1 core for st
 [bgp]
 local_asn       = 65000
 router_id       = "188.184.0.1"
-peer_ip         = "188.184.0.254"
-peer_asn        = 65000
 communities     = ["65000:100"]
 next_hop_self   = true
+
+# One BGP session is opened per entry. VIP announcements fan out to all
+# Established peers; loss of any single peer does not remove the VIP from the
+# other routers' tables (Maglev §4.2: N+1 redundancy, not active/passive).
+[[bgp.peers]]
+peer_ip         = "188.184.0.254"
+peer_asn        = 65000
+
+[[bgp.peers]]
+peer_ip         = "188.184.0.253"
+peer_asn        = 65000
+# Optional per-peer overrides:
+# port            = 179
+# hold_time_secs  = 90
+# communities     = ["65000:200"]
+# enabled         = true
 
 [control_plane]
 config_file     = "/etc/lb/lb-config.json"   # LB config (VIPs + pools), watched via inotify (ADR-001)

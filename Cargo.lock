@@ -877,7 +877,9 @@ name = "lb-bgp"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "criterion",
  "lb-types",
+ "parking_lot",
  "thiserror",
  "tokio",
  "tracing",
@@ -913,6 +915,7 @@ dependencies = [
  "lb-health",
  "lb-metrics",
  "lb-types",
+ "parking_lot",
  "thiserror",
  "tokio",
  "tracing",
@@ -990,6 +993,7 @@ dependencies = [
  "arc-swap",
  "clap",
  "dashmap",
+ "lb-bgp",
  "lb-config-manager",
  "lb-controller",
  "lb-forwarder",
@@ -997,6 +1001,7 @@ dependencies = [
  "lb-io",
  "lb-metrics",
  "lb-types",
+ "parking_lot",
  "tokio",
  "toml",
  "tracing",

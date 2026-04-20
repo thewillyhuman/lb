@@ -685,28 +685,37 @@ A full config reload (`apply_config`) supersedes any pending debounced rebuilds,
 
 > **Code location:** `crates/lb-bgp/`
 
-Each LB node announces all configured VIPs to the upstream router via BGP.
+Each LB node announces all configured VIPs to **every configured upstream router** via BGP, in active-active mode. Per-VIP reachability survives the loss of any single router (Maglev §4.2: N+1 redundancy, not active/passive 1+1).
 
 **Behavior:**
 
-- On startup: the controller waits for the forwarder to confirm it is healthy and serving before announcing any VIPs.
-- Normal operation: all VIPs are announced with equal cost (same BGP local preference and MED), enabling ECMP across all LB nodes.
-- Forwarder unhealthy: the controller **withdraws all VIP announcements** immediately. The router removes this LB node from the ECMP set and stops forwarding packets to it.
-- Forwarder recovers: controller re-announces VIPs. The router re-adds the node to ECMP.
+- On startup: one BGP session is opened per peer. Each session drives its own connect → OPEN handshake → KEEPALIVE loop independently.
+- Normal operation: every VIP announce/withdraw call fans out to every Established peer. Per-peer failure is contained: a broken session does not block announces to the rest of the fleet.
+- Reconnect: a disconnected session retries with exponential backoff starting at 1s, doubling up to a 60s cap. The backoff resets on successful Established. On reconnect, the controller re-announces the full current VIP set to the recovered peer so any drops during the outage are replayed.
+- VIP lifecycle: a VIP is announced while its backend pool has at least one healthy backend, and withdrawn the moment the last healthy backend fails (this reconciliation is eager — not debounced — because a dead VIP must stop receiving traffic immediately).
 
 **BGP configuration:**
 
 ```toml
 [bgp]
-local_asn       = 65000         # internal ASN
-router_id       = "10.0.0.1"    # this LB node's loopback IP
-peer_ip         = "10.0.0.254"  # upstream router IP
-peer_asn        = 65000         # same ASN for iBGP
-communities     = ["65000:100"] # optional, for router policy matching
+local_asn       = 65000              # internal ASN
+router_id       = "10.0.0.1"         # this LB node's loopback IP
+communities     = ["65000:100"]      # default; per-peer override available
 next_hop_self   = true
+
+[[bgp.peers]]
+peer_ip         = "10.0.0.254"
+peer_asn        = 65000
+
+[[bgp.peers]]
+peer_ip         = "10.0.0.253"
+peer_asn        = 65000
+hold_time_secs  = 30                 # optional per-peer override
 ```
 
-**Implementation (`speaker.rs`, `messages.rs`):** Use the `zettabgp` or `bgp-rs` Rust crate, or implement a minimal BGP speaker (UPDATE/KEEPALIVE/OPEN/NOTIFICATION in `messages.rs`) sufficient for VIP announcement. Full BGP feature support is not required.
+The legacy flat form (top-level `peer_ip`/`peer_asn`) is still accepted and converted to a one-element `peers` list. Mixing the two forms in one file is rejected.
+
+**Implementation (`speaker.rs`, `messages.rs`):** The supervisor holds `Vec<PeerHandle>`, one `mpsc::UnboundedSender<SessionCmd>` per peer. Each session runs as an independent tokio task so panics or stalls in one session cannot affect another. Out of scope (future work): graceful restart, route refresh, IPv6 NEXT_HOP, MD5 auth.
 
 ### 7.3 Config Manager
 

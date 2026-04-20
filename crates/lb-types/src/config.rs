@@ -28,21 +28,119 @@ fn default_num_threads() -> usize {
     7
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// BGP configuration for VIP announcement.
+///
+/// Each LB node holds one independent BGP session per configured peer. All
+/// sessions are active-active: VIP announce/withdraw fans out to every live
+/// peer, so loss of any single router does not remove the VIP from the other
+/// routers' routing tables.
+///
+/// For backward compatibility, the legacy single-peer form with top-level
+/// `peer_ip`/`peer_asn` is still accepted and converted to a one-element
+/// `peers` vector.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BgpConfig {
     pub local_asn: u32,
     pub router_id: IpAddr,
+    pub communities: Vec<String>,
+    pub next_hop_self: bool,
+    /// At least one peer must be configured.
+    pub peers: Vec<BgpPeerConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BgpPeerConfig {
     pub peer_ip: IpAddr,
     pub peer_asn: u32,
+    #[serde(default = "default_bgp_port")]
+    pub port: u16,
+    /// Hold time in seconds. `None` defers to the speaker default (90s).
     #[serde(default)]
-    pub communities: Vec<String>,
+    pub hold_time_secs: Option<u16>,
+    /// Per-peer community override. `None` inherits top-level `communities`.
+    #[serde(default)]
+    pub communities: Option<Vec<String>>,
     #[serde(default = "default_true")]
-    pub next_hop_self: bool,
+    pub enabled: bool,
+}
+
+fn default_bgp_port() -> u16 {
+    179
 }
 
 fn default_true() -> bool {
     true
+}
+
+// Raw deserialization helper: accepts both the legacy flat single-peer form
+// (`peer_ip`/`peer_asn` at the top level) and the new `peers = [...]` list.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BgpConfigRaw {
+    local_asn: u32,
+    router_id: IpAddr,
+    #[serde(default)]
+    communities: Vec<String>,
+    #[serde(default = "default_true")]
+    next_hop_self: bool,
+    #[serde(default)]
+    peer_ip: Option<IpAddr>,
+    #[serde(default)]
+    peer_asn: Option<u32>,
+    #[serde(default)]
+    peers: Option<Vec<BgpPeerConfig>>,
+}
+
+impl<'de> Deserialize<'de> for BgpConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = BgpConfigRaw::deserialize(deserializer)?;
+
+        let peers = match (raw.peers, raw.peer_ip, raw.peer_asn) {
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                return Err(serde::de::Error::custom(
+                    "bgp: specify either `peers = [...]` or legacy `peer_ip`/`peer_asn`, not both",
+                ));
+            }
+            (Some(peers), None, None) => {
+                if peers.is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "bgp.peers must contain at least one peer",
+                    ));
+                }
+                peers
+            }
+            (None, Some(peer_ip), Some(peer_asn)) => vec![BgpPeerConfig {
+                peer_ip,
+                peer_asn,
+                port: default_bgp_port(),
+                hold_time_secs: None,
+                communities: None,
+                enabled: true,
+            }],
+            (None, None, None) => {
+                return Err(serde::de::Error::custom(
+                    "bgp: no peers configured (expected `peers = [...]` or legacy `peer_ip`+`peer_asn`)",
+                ));
+            }
+            (None, Some(_), None) | (None, None, Some(_)) => {
+                return Err(serde::de::Error::custom(
+                    "bgp: legacy single-peer form requires both `peer_ip` and `peer_asn`",
+                ));
+            }
+        };
+
+        Ok(BgpConfig {
+            local_asn: raw.local_asn,
+            router_id: raw.router_id,
+            communities: raw.communities,
+            next_hop_self: raw.next_hop_self,
+            peers,
+        })
+    }
 }
 
 /// Per ADR-001: configuration is loaded from a local file, watched via inotify.
@@ -205,10 +303,17 @@ num_threads = 7
 [bgp]
 local_asn = 65000
 router_id = "188.184.0.1"
-peer_ip = "188.184.0.254"
-peer_asn = 65000
 communities = ["65000:100"]
 next_hop_self = true
+
+[[bgp.peers]]
+peer_ip = "188.184.0.254"
+peer_asn = 65000
+
+[[bgp.peers]]
+peer_ip = "188.184.0.253"
+peer_asn = 65000
+hold_time_secs = 30
 
 [control_plane]
 config_file = "/etc/lb/lb-config.json"
@@ -234,8 +339,88 @@ unhealthy_threshold = 3
         let config: NodeConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.node.id, "lb-node-01");
         assert_eq!(config.bgp.local_asn, 65000);
+        assert_eq!(config.bgp.peers.len(), 2);
+        assert_eq!(config.bgp.peers[0].port, 179);
+        assert_eq!(config.bgp.peers[1].hold_time_secs, Some(30));
         assert_eq!(config.forwarder.connection_table_size, 131072);
         assert_eq!(config.forwarder.batch_flush_interval, Duration::from_micros(50));
         assert_eq!(config.health_check_defaults.healthy_threshold, 2);
+    }
+
+    #[test]
+    fn bgp_legacy_single_peer_form_still_accepted() {
+        let toml_str = r#"
+local_asn = 65000
+router_id = "10.0.0.1"
+peer_ip = "10.0.0.254"
+peer_asn = 65000
+"#;
+        let cfg: BgpConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.peers.len(), 1);
+        assert_eq!(
+            cfg.peers[0].peer_ip,
+            "10.0.0.254".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(cfg.peers[0].peer_asn, 65000);
+        assert_eq!(cfg.peers[0].port, 179);
+        assert!(cfg.peers[0].enabled);
+    }
+
+    #[test]
+    fn bgp_rejects_mixed_legacy_and_new_forms() {
+        let toml_str = r#"
+local_asn = 65000
+router_id = "10.0.0.1"
+peer_ip = "10.0.0.254"
+peer_asn = 65000
+[[peers]]
+peer_ip = "10.0.0.253"
+peer_asn = 65000
+"#;
+        let err = toml::from_str::<BgpConfig>(toml_str).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("peers"), "error was: {msg}");
+    }
+
+    #[test]
+    fn bgp_rejects_empty_peers() {
+        let toml_str = r#"
+local_asn = 65000
+router_id = "10.0.0.1"
+peers = []
+"#;
+        let err = toml::from_str::<BgpConfig>(toml_str).unwrap_err();
+        assert!(err.to_string().contains("at least one peer"));
+    }
+
+    #[test]
+    fn bgp_rejects_partial_legacy_form() {
+        let toml_str = r#"
+local_asn = 65000
+router_id = "10.0.0.1"
+peer_ip = "10.0.0.254"
+"#;
+        let err = toml::from_str::<BgpConfig>(toml_str).unwrap_err();
+        assert!(err.to_string().contains("peer_ip"));
+    }
+
+    #[test]
+    fn bgp_accepts_per_peer_community_override() {
+        let toml_str = r#"
+local_asn = 65000
+router_id = "10.0.0.1"
+communities = ["65000:100"]
+[[peers]]
+peer_ip = "10.0.0.254"
+peer_asn = 65000
+communities = ["65000:200"]
+[[peers]]
+peer_ip = "10.0.0.253"
+peer_asn = 65000
+"#;
+        let cfg: BgpConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.communities, vec!["65000:100"]);
+        assert_eq!(cfg.peers[0].communities, Some(vec!["65000:200".into()]));
+        assert_eq!(cfg.peers[1].communities, None);
     }
 }
