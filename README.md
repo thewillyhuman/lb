@@ -1,5 +1,8 @@
 # LB
 
+[![CI](https://github.com/thewillyhuman/lb/actions/workflows/ci.yml/badge.svg)](https://github.com/thewillyhuman/lb/actions/workflows/ci.yml)
+[![Benchmarks](https://github.com/thewillyhuman/lb/actions/workflows/bench.yml/badge.svg)](https://github.com/thewillyhuman/lb/actions/workflows/bench.yml)
+
 A high-performance L4 packet-forwarding load balancer written in Rust, inspired by Google's Maglev (NSDI '16). Designed as a shared infrastructure service with backends spanning multiple IP service domains.
 
 ## Features

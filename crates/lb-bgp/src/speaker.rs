@@ -48,7 +48,7 @@ pub enum PeerState {
 }
 
 /// Event stream emitted by the speaker. Downstream consumers (e.g. metrics)
-/// subscribe via [`BgpSpeaker::event_rx`].
+/// subscribe via [`BgpSpeaker::take_event_rx`].
 #[derive(Debug, Clone)]
 pub enum BgpEvent {
     PeerConnected { peer_ip: IpAddr },
