@@ -252,16 +252,28 @@ When a backend recovers:
 
 ## Monitoring
 
+All three endpoints below are served by the same HTTP listener bound to
+`[node].metrics_addr` (default `127.0.0.1:9100`; set to `0.0.0.0:9100`
+in the node TOML for remote scrape). Plain text, no authentication —
+bind to loopback and scrape from a sidecar, or firewall the interface.
+
 ### Health endpoints
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /healthz` | Process is alive. Returns 200. |
-| `GET /readyz` | Config loaded and forwarder running. Returns 200 or 503. |
+| `GET /healthz` | Process is alive. Returns `200 ok`. Kubernetes-style liveness — a failing probe triggers restart, not de-pooling, so nothing gates this. |
+| `GET /readyz` | Returns `200 ok` iff the initial config has been applied *and* the multi-threaded forwarder is still running. Returns `503` otherwise. Use as the load-balancer / systemd-notify readiness signal. |
+
+### Logs
+
+Structured JSON is the default format, suitable for journald → Loki /
+Vector / Fluent Bit. Log level is driven by the `RUST_LOG` environment
+variable (default `info`). For pretty console output during local dev,
+set `LB_LOG_FORMAT=pretty`.
 
 ### Prometheus metrics
 
-Available at `GET /metrics`. Key metrics:
+Available at `GET /metrics` (`text/plain; version=0.0.4`). Key metrics:
 
 | Metric | Type | Description |
 |--------|------|-------------|
