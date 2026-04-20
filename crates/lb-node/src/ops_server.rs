@@ -43,7 +43,10 @@ pub struct OpsState {
 pub async fn serve(
     addr: SocketAddr,
     state: OpsState,
-) -> std::io::Result<(SocketAddr, impl std::future::Future<Output = std::io::Result<()>>)> {
+) -> std::io::Result<(
+    SocketAddr,
+    impl std::future::Future<Output = std::io::Result<()>>,
+)> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     let app = Router::new()
@@ -130,7 +133,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut stream = tokio::net::TcpStream::connect(bound).await.expect("connect");
+        let mut stream = tokio::net::TcpStream::connect(bound)
+            .await
+            .expect("connect");
         stream
             .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .await
@@ -157,7 +162,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut stream = tokio::net::TcpStream::connect(bound).await.expect("connect");
+        let mut stream = tokio::net::TcpStream::connect(bound)
+            .await
+            .expect("connect");
         stream
             .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .await
