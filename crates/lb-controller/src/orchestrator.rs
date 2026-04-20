@@ -95,6 +95,26 @@ impl Controller {
         }
     }
 
+    /// Withdraw every VIP currently believed-announced. Call this on graceful
+    /// shutdown so the upstream router removes this node from ECMP *before*
+    /// the process exits — otherwise traffic keeps arriving for up to the
+    /// BGP hold-timer (90s default) at the router and blackholes.
+    ///
+    /// Clears `vips_announced`; any later re-announce path (e.g.
+    /// `reannounce_all`) therefore has nothing to fire.
+    pub fn withdraw_all(&mut self) {
+        if let Some(bgp) = &self.bgp {
+            let vips: Vec<Ipv4Addr> = std::mem::take(&mut self.vips_announced)
+                .into_iter()
+                .collect();
+            if !vips.is_empty() {
+                bgp.withdraw(&vips);
+            }
+        } else {
+            self.vips_announced.clear();
+        }
+    }
+
     /// Apply a new configuration. Rebuilds all lookup tables and swaps them atomically.
     ///
     /// Any pending debounced rebuilds are discarded since we're rebuilding everything.
@@ -809,6 +829,36 @@ mod tests {
             }
             _ => panic!("expected single Announce, got {events:?}"),
         }
+    }
+
+    #[test]
+    fn withdraw_all_emits_withdraw_and_clears_announced_set() {
+        let (mut ctl, mock, vip_a, vip_b) = setup_with_bgp();
+        mock.drain();
+
+        ctl.withdraw_all();
+
+        let events = mock.drain();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AnnouncerEvent::Withdraw(v) => {
+                assert!(v.contains(&vip_a));
+                assert!(v.contains(&vip_b));
+            }
+            _ => panic!("expected single Withdraw, got {events:?}"),
+        }
+
+        // Idempotent: a second call must not fire anything.
+        ctl.withdraw_all();
+        let events = mock.drain();
+        assert!(
+            events.is_empty(),
+            "withdraw_all fired after the set was already empty: {events:?}"
+        );
+
+        // `reannounce_all` must not fire either — the announced set is empty.
+        ctl.reannounce_all();
+        assert!(mock.drain().is_empty());
     }
 
     #[test]
