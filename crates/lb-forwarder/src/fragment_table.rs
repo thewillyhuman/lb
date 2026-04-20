@@ -84,7 +84,10 @@ impl FragmentTable {
         for _ in 0..capacity {
             let entry = &self.entries[idx];
 
-            if !entry.occupied || now.duration_since(entry.inserted_at) > self.ttl || entry.hash == cur_hash {
+            if !entry.occupied
+                || now.duration_since(entry.inserted_at) > self.ttl
+                || entry.hash == cur_hash
+            {
                 self.entries[idx] = FragmentEntry {
                     hash: cur_hash,
                     backend_ip: cur_ip,

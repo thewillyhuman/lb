@@ -1,6 +1,6 @@
 use crate::loader::LbConfig;
 use lb_hashing::LookupTable;
-use lb_types::{Backend, BackendPoolId, BackendPool, HealthStatus};
+use lb_types::{Backend, BackendPool, BackendPoolId, HealthStatus};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -61,10 +61,7 @@ pub fn build_backend_pool_index(config: &LbConfig) -> HashMap<IpAddr, HashSet<Ba
     let mut index: HashMap<IpAddr, HashSet<BackendPoolId>> = HashMap::new();
     for pool in &config.pools {
         for backend in &pool.backends {
-            index
-                .entry(backend.ip)
-                .or_default()
-                .insert(pool.id.clone());
+            index.entry(backend.ip).or_default().insert(pool.id.clone());
         }
     }
     index
@@ -152,7 +149,10 @@ mod tests {
         )
         .unwrap();
         let mut shared = HashMap::new();
-        shared.insert(pool_id.clone(), Arc::new(ArcSwap::from_pointee(initial_table)));
+        shared.insert(
+            pool_id.clone(),
+            Arc::new(ArcSwap::from_pointee(initial_table)),
+        );
 
         // Verify initial state
         assert_eq!(shared[&pool_id].load().num_backends(), 1);
@@ -214,16 +214,12 @@ mod tests {
             pools: vec![
                 BackendPool {
                     id: BackendPoolId("pool-a".into()),
-                    backends: vec![
-                        Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443),
-                    ],
+                    backends: vec![Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443)],
                     health_check: None,
                 },
                 BackendPool {
                     id: BackendPoolId("pool-b".into()),
-                    backends: vec![
-                        Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 8080),
-                    ],
+                    backends: vec![Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 8080)],
                     health_check: None,
                 },
             ],

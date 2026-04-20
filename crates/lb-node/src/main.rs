@@ -105,11 +105,7 @@ fn main() {
     let mut lookup_tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>> = HashMap::new();
 
     if let Some((_, ref lb_config)) = initial_lb_config {
-        apply_lb_config(
-            lb_config,
-            &mut lookup_tables,
-            &vip_matcher,
-        );
+        apply_lb_config(lb_config, &mut lookup_tables, &vip_matcher);
     }
 
     // BGP speaker — one session per configured peer. Spawned on a dedicated
@@ -302,10 +298,7 @@ fn apply_lb_config(
     for pool in &config.pools {
         if !pool.backends.is_empty() {
             if let Ok(table) = LookupTable::build(&pool.backends, lb_hashing::DEFAULT_TABLE_SIZE) {
-                lookup_tables.insert(
-                    pool.id.clone(),
-                    Arc::new(ArcSwap::from_pointee(table)),
-                );
+                lookup_tables.insert(pool.id.clone(), Arc::new(ArcSwap::from_pointee(table)));
             }
         }
     }

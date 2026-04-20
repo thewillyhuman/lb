@@ -14,11 +14,7 @@ pub enum BgpMessageType {
 }
 
 /// Serialize a BGP OPEN message (RFC 4271 Section 4.2).
-pub fn encode_open(
-    local_asn: u16,
-    hold_time: u16,
-    router_id: Ipv4Addr,
-) -> BytesMut {
+pub fn encode_open(local_asn: u16, hold_time: u16, router_id: Ipv4Addr) -> BytesMut {
     let mut buf = BytesMut::new();
 
     // BGP header: marker (16) + length (2) + type (1)

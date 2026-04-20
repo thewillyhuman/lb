@@ -155,7 +155,9 @@ impl Controller {
 
         let mut out = BTreeSet::new();
         for vip in &config.vips {
-            let IpAddr::V4(v4) = vip.address else { continue };
+            let IpAddr::V4(v4) = vip.address else {
+                continue;
+            };
             let any_service_healthy = vip.services.iter().any(|svc| {
                 pool_healthy
                     .get(&BackendPoolId(svc.backend_pool.clone()))
@@ -179,15 +181,10 @@ impl Controller {
 
         let desired = self.desired_announced_vips();
 
-        let to_announce: Vec<Ipv4Addr> = desired
-            .difference(&self.vips_announced)
-            .copied()
-            .collect();
-        let to_withdraw: Vec<Ipv4Addr> = self
-            .vips_announced
-            .difference(&desired)
-            .copied()
-            .collect();
+        let to_announce: Vec<Ipv4Addr> =
+            desired.difference(&self.vips_announced).copied().collect();
+        let to_withdraw: Vec<Ipv4Addr> =
+            self.vips_announced.difference(&desired).copied().collect();
 
         if !to_announce.is_empty() {
             tracing::info!(count = to_announce.len(), "announcing VIPs");
@@ -298,17 +295,17 @@ impl Controller {
                 .map(|entry| (*entry.key(), *entry.value()))
                 .collect();
 
-            let new_tables = applier::build_lookup_tables_for_pools(
-                &affected_pools,
-                &health,
-                self.table_size,
-            );
+            let new_tables =
+                applier::build_lookup_tables_for_pools(&affected_pools, &health, self.table_size);
 
             tracing::info!(
                 affected_pools = affected_pools.len(),
                 total_pools = config.pools.len(),
                 pending_changes = self.pending_pools.len(),
-                debounce_ms = self.pending_since.map(|s| s.elapsed().as_millis()).unwrap_or(0),
+                debounce_ms = self
+                    .pending_since
+                    .map(|s| s.elapsed().as_millis())
+                    .unwrap_or(0),
                 "flushing debounced lookup table rebuilds"
             );
 
@@ -386,7 +383,10 @@ mod tests {
 
     fn setup_controller(
         config: &LbConfig,
-    ) -> (Controller, HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>) {
+    ) -> (
+        Controller,
+        HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
+    ) {
         let mut tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>> = HashMap::new();
         for pool in &config.pools {
             let table = LookupTable::build(&pool.backends, 17).unwrap();
@@ -668,9 +668,7 @@ mod tests {
                 },
                 BackendPool {
                     id: BackendPoolId("pool-b".into()),
-                    backends: vec![
-                        Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)), 443),
-                    ],
+                    backends: vec![Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)), 443)],
                     health_check: None,
                 },
             ],
@@ -687,8 +685,8 @@ mod tests {
         }
         let health = Arc::new(DashMap::new());
         let mock = Arc::new(MockAnnouncer::default());
-        let mut ctl = Controller::new(tables, health, 17)
-            .with_bgp(mock.clone() as Arc<dyn BgpAnnouncer>);
+        let mut ctl =
+            Controller::new(tables, health, 17).with_bgp(mock.clone() as Arc<dyn BgpAnnouncer>);
         ctl.apply_config(cfg);
         (ctl, mock, vip_a, vip_b)
     }

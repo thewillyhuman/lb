@@ -37,12 +37,7 @@ mod inner {
     impl Default for DpdkConfig {
         fn default() -> Self {
             Self {
-                eal_args: vec![
-                    "-l".into(),
-                    "0-7".into(),
-                    "-n".into(),
-                    "4".into(),
-                ],
+                eal_args: vec!["-l".into(), "0-7".into(), "-n".into(), "4".into()],
                 port_id: 0,
                 num_rx_queues: 1,
                 num_tx_queues: 1,
@@ -78,11 +73,7 @@ mod inner {
                 Self::init_port(config)?;
             }
 
-            tracing::info!(
-                port = config.port_id,
-                queue = queue_id,
-                "DPDK I/O created"
-            );
+            tracing::info!(port = config.port_id, queue = queue_id, "DPDK I/O created");
 
             Ok(Self {
                 port_id: config.port_id,
@@ -214,11 +205,17 @@ mod stub {
 
     impl PacketIo for DpdkIo {
         fn recv_batch(&mut self, _buf: &mut [PacketBuf]) -> io::Result<usize> {
-            Err(io::Error::new(io::ErrorKind::Unsupported, "DPDK not available"))
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "DPDK not available",
+            ))
         }
 
         fn send_batch(&mut self, _buf: &[PacketBuf]) -> io::Result<usize> {
-            Err(io::Error::new(io::ErrorKind::Unsupported, "DPDK not available"))
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "DPDK not available",
+            ))
         }
     }
 }

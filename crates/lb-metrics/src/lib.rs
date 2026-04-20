@@ -1,8 +1,8 @@
-pub mod forwarder_metrics;
 pub mod controller_metrics;
+pub mod forwarder_metrics;
 
-pub use forwarder_metrics::{EvictionLabels, ForwarderMetrics, TcpTransitionLabels};
 pub use controller_metrics::{BgpMetrics, ControllerMetrics, PeerLabels};
+pub use forwarder_metrics::{EvictionLabels, ForwarderMetrics, TcpTransitionLabels};
 
 use parking_lot::Mutex;
 use prometheus_client::registry::Registry;

@@ -48,6 +48,9 @@ mod tests {
             queues_used.insert(assign_queue(&meta, num_queues));
         }
         // With 100 different flows and 8 queues, we should hit most queues
-        assert!(queues_used.len() >= 4, "expected distribution across queues");
+        assert!(
+            queues_used.len() >= 4,
+            "expected distribution across queues"
+        );
     }
 }

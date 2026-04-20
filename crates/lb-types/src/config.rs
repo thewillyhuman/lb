@@ -191,12 +191,8 @@ impl ForwarderConfig {
         match &self.connection_ttls {
             None => defaults,
             Some(c) => ConnTtls {
-                tcp_handshake: c
-                    .tcp_handshake
-                    .unwrap_or(defaults.tcp_handshake),
-                tcp_established: c
-                    .tcp_established
-                    .unwrap_or(defaults.tcp_established),
+                tcp_handshake: c.tcp_handshake.unwrap_or(defaults.tcp_handshake),
+                tcp_established: c.tcp_established.unwrap_or(defaults.tcp_established),
                 tcp_closing: c.tcp_closing.unwrap_or(defaults.tcp_closing),
                 udp: c.udp.unwrap_or(defaults.udp),
                 other: c.other.unwrap_or(defaults.other),
@@ -429,7 +425,10 @@ unhealthy_threshold = 3
         assert_eq!(config.bgp.peers[0].port, 179);
         assert_eq!(config.bgp.peers[1].hold_time_secs, Some(30));
         assert_eq!(config.forwarder.connection_table_size, 131072);
-        assert_eq!(config.forwarder.batch_flush_interval, Duration::from_micros(50));
+        assert_eq!(
+            config.forwarder.batch_flush_interval,
+            Duration::from_micros(50)
+        );
         assert_eq!(config.health_check_defaults.healthy_threshold, 2);
     }
 

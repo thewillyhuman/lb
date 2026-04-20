@@ -81,15 +81,11 @@ fn bench_announce_fanout(c: &mut Criterion) {
             .map(|i| Ipv4Addr::new(203, 0, 113, i as u8))
             .collect();
 
-        group.bench_with_input(
-            BenchmarkId::from_parameter(n_peers),
-            &n_peers,
-            |b, _| {
-                b.iter(|| {
-                    speaker.announce(black_box(&vips));
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(n_peers), &n_peers, |b, _| {
+            b.iter(|| {
+                speaker.announce(black_box(&vips));
+            });
+        });
     }
 
     group.finish();

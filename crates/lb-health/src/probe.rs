@@ -168,16 +168,12 @@ impl Probe for HttpsProbe {
             }
         };
 
-        let mut tls_stream = match timeout(
-            probe_timeout,
-            self.connector.connect(server_name, stream),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => return ProbeResult::Failure(format!("TLS handshake failed: {e}")),
-            Err(_) => return ProbeResult::Failure("TLS handshake timed out".into()),
-        };
+        let mut tls_stream =
+            match timeout(probe_timeout, self.connector.connect(server_name, stream)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return ProbeResult::Failure(format!("TLS handshake failed: {e}")),
+                Err(_) => return ProbeResult::Failure("TLS handshake timed out".into()),
+            };
 
         let request = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
@@ -283,15 +279,16 @@ mod tests {
     async fn tcp_probe_failure() {
         // Use a port that's almost certainly not listening
         let probe = TcpProbe;
-        let result = probe.check(&backend(19999), Duration::from_millis(100)).await;
+        let result = probe
+            .check(&backend(19999), Duration::from_millis(100))
+            .await;
         assert!(!result.is_success());
     }
 
     #[tokio::test]
     async fn http_probe_success() {
         // Start a tiny HTTP server
-        let app = axum::Router::new()
-            .route("/healthz", axum::routing::get(|| async { "ok" }));
+        let app = axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -311,8 +308,8 @@ mod tests {
         // Generate a self-signed certificate
         let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
-            .unwrap();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
 
         let tls_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -353,7 +350,9 @@ mod tests {
     #[tokio::test]
     async fn https_probe_connection_refused() {
         let probe = HttpsProbe::insecure("/healthz");
-        let result = probe.check(&backend(19997), Duration::from_millis(100)).await;
+        let result = probe
+            .check(&backend(19997), Duration::from_millis(100))
+            .await;
         assert!(!result.is_success());
     }
 }

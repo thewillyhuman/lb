@@ -7,8 +7,7 @@ use lb_hashing::LookupTable;
 use lb_io::PacketBuf;
 use lb_metrics::{EvictionLabels, ForwarderMetrics, TcpTransitionLabels};
 use lb_types::{
-    BackendPoolId, ConnTtls, FlowProto, HealthStatus, MtuConfig, PacketMeta, TcpFlowState,
-    TcpFlags,
+    BackendPoolId, ConnTtls, FlowProto, HealthStatus, MtuConfig, PacketMeta, TcpFlags, TcpFlowState,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -88,8 +87,12 @@ impl RewriterThread {
             }
         }
 
-        self.metrics.conn_table_size.set(self.conn_table.len() as i64);
-        self.metrics.conn_table_fill_bp.set(self.conn_table.fill_bp());
+        self.metrics
+            .conn_table_size
+            .set(self.conn_table.len() as i64);
+        self.metrics
+            .conn_table_fill_bp
+            .set(self.conn_table.fill_bp());
         write_idx
     }
 
@@ -114,9 +117,15 @@ impl RewriterThread {
         // MSS clamp (TCP SYN only, before backend selection per spec §3.4)
         let mut output = input.clone();
         match mss_clamp::clamp_mss(output.as_mut_slice(), self.mtu_config.tcp_mss_clamp) {
-            ClampResult::Clamped => { self.metrics.mss_clamp_total.inc(); }
-            ClampResult::Noop => { self.metrics.mss_clamp_noop_total.inc(); }
-            ClampResult::MssMissing => { self.metrics.mss_clamp_missing_total.inc(); }
+            ClampResult::Clamped => {
+                self.metrics.mss_clamp_total.inc();
+            }
+            ClampResult::Noop => {
+                self.metrics.mss_clamp_noop_total.inc();
+            }
+            ClampResult::MssMissing => {
+                self.metrics.mss_clamp_missing_total.inc();
+            }
             ClampResult::NotTcp | ClampResult::NotSyn => {}
         }
 
@@ -238,12 +247,7 @@ impl RewriterThread {
     }
 
     #[inline(always)]
-    fn apply_tcp_transitions(
-        &mut self,
-        hash: u64,
-        flags: TcpFlags,
-        now: std::time::Instant,
-    ) {
+    fn apply_tcp_transitions(&mut self, hash: u64, flags: TcpFlags, now: std::time::Instant) {
         // RST takes priority: even on a SYN+RST (malformed but possible under
         // attack), the connection is terminated.
         if flags.rst() {
@@ -337,14 +341,12 @@ mod tests {
         let pool_id = BackendPoolId("web".into());
 
         let mut tables = HashMap::new();
-        tables.insert(pool_id.clone(), Arc::new(ArcSwap::from_pointee(lookup_table)));
+        tables.insert(
+            pool_id.clone(),
+            Arc::new(ArcSwap::from_pointee(lookup_table)),
+        );
 
-        let vip_matcher = VipMatcher::from_entries(vec![(
-            vip_ip(),
-            Protocol::Tcp,
-            443,
-            pool_id,
-        )]);
+        let vip_matcher = VipMatcher::from_entries(vec![(vip_ip(), Protocol::Tcp, 443, pool_id)]);
 
         let mut registry = prometheus_client::registry::Registry::default();
         let metrics = ForwarderMetrics::register(&mut registry);
@@ -433,13 +435,11 @@ mod tests {
         let lookup_table = LookupTable::build(&backends, 17).unwrap();
         let pool_id = BackendPoolId("web".into());
         let mut tables = HashMap::new();
-        tables.insert(pool_id.clone(), Arc::new(ArcSwap::from_pointee(lookup_table)));
-        let vip_matcher = VipMatcher::from_entries(vec![(
-            vip_ip(),
-            Protocol::Tcp,
-            443,
-            pool_id,
-        )]);
+        tables.insert(
+            pool_id.clone(),
+            Arc::new(ArcSwap::from_pointee(lookup_table)),
+        );
+        let vip_matcher = VipMatcher::from_entries(vec![(vip_ip(), Protocol::Tcp, 443, pool_id)]);
         let mut registry = prometheus_client::registry::Registry::default();
         let metrics = ForwarderMetrics::register(&mut registry);
         let ttls = ConnTtls {
@@ -462,23 +462,33 @@ mod tests {
         );
 
         // SYN → Handshake entry created.
-        let syn = build_tcp_packet_with_flags([10, 0, 0, 100], [188, 184, 100, 10], 11111, 443, 0x02);
+        let syn =
+            build_tcp_packet_with_flags([10, 0, 0, 100], [188, 184, 100, 10], 11111, 443, 0x02);
         rewriter.process_batch(&mut [syn]);
         assert!(rewriter.metrics.conn_table_inserts_total.get() >= 1);
 
         // FIN from the same flow → Closing transition.
-        let fin = build_tcp_packet_with_flags([10, 0, 0, 100], [188, 184, 100, 10], 11111, 443, 0x11);
+        let fin =
+            build_tcp_packet_with_flags([10, 0, 0, 100], [188, 184, 100, 10], 11111, 443, 0x11);
         rewriter.process_batch(&mut [fin]);
         let fin_count = rewriter
             .metrics
             .conn_table_tcp_transitions_total
-            .get_or_create(&TcpTransitionLabels { to: "closing_fin".into() })
+            .get_or_create(&TcpTransitionLabels {
+                to: "closing_fin".into(),
+            })
             .get();
         assert_eq!(fin_count, 1);
 
         // The entry should be gone within `tcp_closing`.
         std::thread::sleep(Duration::from_millis(20));
-        let mut data_pkt = vec![build_tcp_packet_with_flags([10, 0, 0, 100], [188, 184, 100, 10], 11111, 443, 0x10)];
+        let mut data_pkt = vec![build_tcp_packet_with_flags(
+            [10, 0, 0, 100],
+            [188, 184, 100, 10],
+            11111,
+            443,
+            0x10,
+        )];
         rewriter.process_batch(&mut data_pkt);
         // After Closing + TTL expiry: the data packet should not find a cached
         // entry, so misses should have increased.
@@ -490,17 +500,21 @@ mod tests {
         let mut rewriter = setup_rewriter();
 
         // First: SYN → Handshake.
-        let syn = build_tcp_packet_with_flags([10, 0, 0, 50], [188, 184, 100, 10], 22222, 443, 0x02);
+        let syn =
+            build_tcp_packet_with_flags([10, 0, 0, 50], [188, 184, 100, 10], 22222, 443, 0x02);
         rewriter.process_batch(&mut [syn]);
 
         // Then: bare ACK → promotion transition recorded.
-        let ack = build_tcp_packet_with_flags([10, 0, 0, 50], [188, 184, 100, 10], 22222, 443, 0x10);
+        let ack =
+            build_tcp_packet_with_flags([10, 0, 0, 50], [188, 184, 100, 10], 22222, 443, 0x10);
         rewriter.process_batch(&mut [ack]);
 
         let promoted = rewriter
             .metrics
             .conn_table_tcp_transitions_total
-            .get_or_create(&TcpTransitionLabels { to: "established".into() })
+            .get_or_create(&TcpTransitionLabels {
+                to: "established".into(),
+            })
             .get();
         assert!(promoted >= 1);
     }
@@ -509,16 +523,20 @@ mod tests {
     fn rst_marks_closing() {
         let mut rewriter = setup_rewriter();
 
-        let syn = build_tcp_packet_with_flags([10, 0, 0, 77], [188, 184, 100, 10], 33333, 443, 0x02);
+        let syn =
+            build_tcp_packet_with_flags([10, 0, 0, 77], [188, 184, 100, 10], 33333, 443, 0x02);
         rewriter.process_batch(&mut [syn]);
 
-        let rst = build_tcp_packet_with_flags([10, 0, 0, 77], [188, 184, 100, 10], 33333, 443, 0x04);
+        let rst =
+            build_tcp_packet_with_flags([10, 0, 0, 77], [188, 184, 100, 10], 33333, 443, 0x04);
         rewriter.process_batch(&mut [rst]);
 
         let rst_count = rewriter
             .metrics
             .conn_table_tcp_transitions_total
-            .get_or_create(&TcpTransitionLabels { to: "closing_rst".into() })
+            .get_or_create(&TcpTransitionLabels {
+                to: "closing_rst".into(),
+            })
             .get();
         assert_eq!(rst_count, 1);
     }
@@ -532,13 +550,11 @@ mod tests {
         let lookup_table = LookupTable::build(&backends, 17).unwrap();
         let pool_id = BackendPoolId("web".into());
         let mut tables = HashMap::new();
-        tables.insert(pool_id.clone(), Arc::new(ArcSwap::from_pointee(lookup_table)));
-        let vip_matcher = VipMatcher::from_entries(vec![(
-            vip_ip(),
-            Protocol::Tcp,
-            443,
-            pool_id,
-        )]);
+        tables.insert(
+            pool_id.clone(),
+            Arc::new(ArcSwap::from_pointee(lookup_table)),
+        );
+        let vip_matcher = VipMatcher::from_entries(vec![(vip_ip(), Protocol::Tcp, 443, pool_id)]);
         let mut registry = prometheus_client::registry::Registry::default();
         let metrics = ForwarderMetrics::register(&mut registry);
         let health = Arc::new(DashMap::new());
@@ -576,7 +592,10 @@ mod tests {
         let second = build_tcp_packet([10, 0, 0, 123], [188, 184, 100, 10], 44444, 443);
         rewriter.process_batch(&mut [second]);
 
-        assert_eq!(rewriter.metrics.conn_table_fallback_to_maglev_total.get(), 1);
+        assert_eq!(
+            rewriter.metrics.conn_table_fallback_to_maglev_total.get(),
+            1
+        );
     }
 
     #[test]
@@ -597,14 +616,7 @@ mod tests {
     fn batch_processing_multiple_packets() {
         let mut rewriter = setup_rewriter();
         let mut batch: Vec<PacketBuf> = (0..10)
-            .map(|i| {
-                build_tcp_packet(
-                    [10, 0, 0, i as u8 + 1],
-                    [188, 184, 100, 10],
-                    10000 + i,
-                    443,
-                )
-            })
+            .map(|i| build_tcp_packet([10, 0, 0, i as u8 + 1], [188, 184, 100, 10], 10000 + i, 443))
             .collect();
 
         let processed = rewriter.process_batch(&mut batch);
@@ -674,7 +686,10 @@ mod tests {
         let pool_id = BackendPoolId("web".into());
 
         let mut tables = HashMap::new();
-        tables.insert(pool_id.clone(), Arc::new(ArcSwap::from_pointee(lookup_table)));
+        tables.insert(
+            pool_id.clone(),
+            Arc::new(ArcSwap::from_pointee(lookup_table)),
+        );
 
         let vip_matcher = VipMatcher::from_entries(vec![
             (vip_ip(), Protocol::Tcp, 443, pool_id.clone()),

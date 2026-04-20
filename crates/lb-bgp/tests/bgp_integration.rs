@@ -78,7 +78,10 @@ async fn burst_announce_and_withdraw_preserves_order() {
     speaker.spawn(&tokio::runtime::Handle::current());
 
     wait_for_state_count(&speaker, PeerState::Established, 1, EVENT_BUDGET).await;
-    assert_eq!(router.expect_event(EVENT_BUDGET).await, RouterEvent::Connected);
+    assert_eq!(
+        router.expect_event(EVENT_BUDGET).await,
+        RouterEvent::Connected
+    );
 
     let announced: Vec<Ipv4Addr> = (1..=10).map(|i| Ipv4Addr::new(203, 0, 113, i)).collect();
     speaker.announce(&announced);
@@ -86,9 +89,11 @@ async fn burst_announce_and_withdraw_preserves_order() {
     for vip in &announced {
         let mut skipped = Vec::new();
         let ev = router
-            .expect_event_matching(EVENT_BUDGET, &mut skipped, |e| {
-                matches!(e, RouterEvent::Announced { vip: v } if v == vip)
-            })
+            .expect_event_matching(
+                EVENT_BUDGET,
+                &mut skipped,
+                |e| matches!(e, RouterEvent::Announced { vip: v } if v == vip),
+            )
             .await;
         assert_eq!(ev, RouterEvent::Announced { vip: *vip });
     }
@@ -99,9 +104,11 @@ async fn burst_announce_and_withdraw_preserves_order() {
     for vip in &withdraw_half {
         let mut skipped = Vec::new();
         let ev = router
-            .expect_event_matching(EVENT_BUDGET, &mut skipped, |e| {
-                matches!(e, RouterEvent::Withdrawn { vip: v } if v == vip)
-            })
+            .expect_event_matching(
+                EVENT_BUDGET,
+                &mut skipped,
+                |e| matches!(e, RouterEvent::Withdrawn { vip: v } if v == vip),
+            )
             .await;
         assert_eq!(ev, RouterEvent::Withdrawn { vip: *vip });
     }
@@ -177,9 +184,11 @@ async fn one_unreachable_peer_does_not_block_others() {
     let mut router = real;
     let mut skipped = Vec::new();
     let ev = router
-        .expect_event_matching(EVENT_BUDGET, &mut skipped, |e| {
-            matches!(e, RouterEvent::Announced { vip: v } if v == &vip)
-        })
+        .expect_event_matching(
+            EVENT_BUDGET,
+            &mut skipped,
+            |e| matches!(e, RouterEvent::Announced { vip: v } if v == &vip),
+        )
         .await;
     assert_eq!(ev, RouterEvent::Announced { vip });
 
@@ -191,8 +200,15 @@ async fn one_unreachable_peer_does_not_block_others() {
         .iter()
         .filter(|(_, s)| *s == PeerState::Established)
         .count();
-    assert_eq!(established, 1, "expected exactly one Established peer, got {states:?}");
-    assert_eq!(states.len() - established, 1, "unreachable peer should stay non-Established: {states:?}");
+    assert_eq!(
+        established, 1,
+        "expected exactly one Established peer, got {states:?}"
+    );
+    assert_eq!(
+        states.len() - established,
+        1,
+        "unreachable peer should stay non-Established: {states:?}"
+    );
 
     speaker.shutdown().await;
     router.stop().await;
@@ -217,7 +233,10 @@ async fn reconnect_after_peer_drops_mid_session() {
     // First connect: handshake, then disconnect.
     let mut r1 = flaky;
     assert_eq!(r1.expect_event(EVENT_BUDGET).await, RouterEvent::Connected);
-    assert_eq!(r1.expect_event(EVENT_BUDGET).await, RouterEvent::Disconnected);
+    assert_eq!(
+        r1.expect_event(EVENT_BUDGET).await,
+        RouterEvent::Disconnected
+    );
     r1.stop().await;
 
     // Supervisor should fall back to Backoff → Connecting. We don't assert on
@@ -243,7 +262,10 @@ async fn reconnect_after_peer_drops_mid_session() {
         let _ = stream.read(&mut buf).await; // OPEN
         let reply = messages::encode_open(65000, 90, Ipv4Addr::new(10, 0, 0, 254));
         stream.write_all(&reply).await.unwrap();
-        stream.write_all(&messages::encode_keepalive()).await.unwrap();
+        stream
+            .write_all(&messages::encode_keepalive())
+            .await
+            .unwrap();
         // Read speaker's confirming KEEPALIVE before returning.
         let _ = stream.read(&mut buf).await;
         stream
@@ -297,7 +319,10 @@ async fn interleaved_announce_withdraw_preserves_sequence() {
     speaker.spawn(&tokio::runtime::Handle::current());
 
     wait_for_state_count(&speaker, PeerState::Established, 1, EVENT_BUDGET).await;
-    assert_eq!(router.expect_event(EVENT_BUDGET).await, RouterEvent::Connected);
+    assert_eq!(
+        router.expect_event(EVENT_BUDGET).await,
+        RouterEvent::Connected
+    );
 
     let a = Ipv4Addr::new(203, 0, 113, 1);
     let b = Ipv4Addr::new(203, 0, 113, 2);

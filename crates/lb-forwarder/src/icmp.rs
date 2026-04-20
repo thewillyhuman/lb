@@ -86,7 +86,7 @@ pub fn generate_icmp_frag_needed(
     icmp[0] = ICMP_TYPE_DEST_UNREACH;
     icmp[1] = ICMP_CODE_FRAG_NEEDED;
     icmp[2..4].copy_from_slice(&[0, 0]); // checksum placeholder
-    // Bytes 4-5: unused (must be zero)
+                                         // Bytes 4-5: unused (must be zero)
     icmp[4] = 0;
     icmp[5] = 0;
     // Bytes 6-7: Next-Hop MTU
