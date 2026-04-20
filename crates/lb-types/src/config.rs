@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -22,10 +22,20 @@ pub struct NodeSection {
     pub data_iface: String,
     #[serde(default = "default_num_threads")]
     pub num_threads: usize,
+    /// Address the operations HTTP server binds to (`/healthz`, `/readyz`,
+    /// `/metrics`). Defaults to `127.0.0.1:9100` so operators scraping
+    /// Prometheus from localhost work out of the box; bind to `0.0.0.0:9100`
+    /// for cross-host scraping.
+    #[serde(default = "default_metrics_addr")]
+    pub metrics_addr: SocketAddr,
 }
 
 fn default_num_threads() -> usize {
     7
+}
+
+fn default_metrics_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 9100))
 }
 
 /// BGP configuration for VIP announcement.
@@ -381,6 +391,7 @@ id = "lb-node-01"
 loopback_ip = "188.184.0.1"
 data_iface = "eth0"
 num_threads = 7
+metrics_addr = "127.0.0.1:9200"
 
 [bgp]
 local_asn = 65000
@@ -420,6 +431,7 @@ unhealthy_threshold = 3
 
         let config: NodeConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.node.id, "lb-node-01");
+        assert_eq!(config.node.metrics_addr.port(), 9200);
         assert_eq!(config.bgp.local_asn, 65000);
         assert_eq!(config.bgp.peers.len(), 2);
         assert_eq!(config.bgp.peers[0].port, 179);
@@ -430,6 +442,18 @@ unhealthy_threshold = 3
             Duration::from_micros(50)
         );
         assert_eq!(config.health_check_defaults.healthy_threshold, 2);
+    }
+
+    #[test]
+    fn metrics_addr_defaults_to_localhost_9100() {
+        let toml_str = r#"
+id = "node"
+loopback_ip = "10.0.0.1"
+data_iface = "eth0"
+"#;
+        let section: NodeSection = toml::from_str(toml_str).unwrap();
+        assert_eq!(section.metrics_addr.port(), 9100);
+        assert!(section.metrics_addr.ip().is_loopback());
     }
 
     #[test]
