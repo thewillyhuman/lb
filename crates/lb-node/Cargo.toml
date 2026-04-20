@@ -14,6 +14,7 @@ lb-metrics = { workspace = true }
 lb-io = { workspace = true }
 lb-bgp = { workspace = true }
 tokio = { workspace = true }
+axum = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
