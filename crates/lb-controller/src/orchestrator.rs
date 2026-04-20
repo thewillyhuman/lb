@@ -204,12 +204,13 @@ impl Controller {
     /// per-packet health check sees it right away (falling back to a fresh
     /// Maglev lookup for flows pinned to the dead backend). The lookup table
     /// rebuild is debounced: affected pool IDs are accumulated and flushed
-    /// after [`DEBOUNCE_WINDOW`] (50ms) has elapsed since the first pending
+    /// after the debounce window (50ms) has elapsed since the first pending
     /// change. This coalesces correlated failures (e.g., a rack switch dying
     /// takes 20 backends offline) into a single rebuild per affected pool.
     ///
-    /// Call [`tick`] periodically (or after the last health event in a batch)
-    /// to flush pending rebuilds if no further `on_health_change` calls arrive.
+    /// Call [`Self::tick`] periodically (or after the last health event in a
+    /// batch) to flush pending rebuilds if no further `on_health_change`
+    /// calls arrive.
     pub fn on_health_change(&mut self, backend_ip: IpAddr, status: HealthStatus) {
         // Always update the shared health map immediately — the rewriter
         // checks this per-packet and will fall back to Maglev for flows

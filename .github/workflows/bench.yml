@@ -1,0 +1,88 @@
+name: Benchmarks
+
+# Benchmarks are *informational*. GitHub-hosted runners have too much
+# CPU variance to gate PRs on absolute numbers — trying to do so produces
+# flaky CI. Instead we:
+#   * run the full bench suite on every push to main and publish the
+#     criterion HTML report + raw JSON as a downloadable artifact
+#   * expose a manual `workflow_dispatch` trigger so operators can kick
+#     a bench run at any time
+#
+# The raw `cargo bench` output appears in the action log; the uploaded
+# artifact contains criterion's HTML report (drag-and-drop to browse).
+#
+# A proper performance-regression gate needs either a self-hosted runner
+# with pinned CPU/governor settings, or an external service (e.g.
+# bencher.dev). Both are out of scope for v1.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: "Which crate's benches to run (blank = all bench-enabled crates)"
+        required: false
+        default: ""
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: cargo bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Scope the cache to `bench` so it stays separate from the
+          # debug-profile cache the main CI workflow populates.
+          shared-key: bench
+
+      - name: Compile benches (no run)
+        # Pre-build first so each `cargo bench` step output is just the
+        # measurement section, keeping the log readable.
+        run: |
+          set -euxo pipefail
+          CRATES=(lb-hashing lb-forwarder lb-controller lb-bgp)
+          if [[ -n "${{ github.event.inputs.crate }}" ]]; then
+            CRATES=("${{ github.event.inputs.crate }}")
+          fi
+          for c in "${CRATES[@]}"; do
+            cargo bench -p "$c" --no-run
+          done
+
+      - name: Run benches
+        run: |
+          set -euxo pipefail
+          CRATES=(lb-hashing lb-forwarder lb-controller lb-bgp)
+          if [[ -n "${{ github.event.inputs.crate }}" ]]; then
+            CRATES=("${{ github.event.inputs.crate }}")
+          fi
+          # Short measurement time keeps CI runtime sane while still
+          # producing meaningful numbers. Operators who want publication-
+          # quality measurements should run benches locally on a quiet
+          # machine.
+          for c in "${CRATES[@]}"; do
+            cargo bench -p "$c" -- --warm-up-time 1 --measurement-time 2
+          done
+
+      - name: Upload criterion report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report-${{ github.sha }}
+          path: target/criterion
+          if-no-files-found: warn
+          retention-days: 30
