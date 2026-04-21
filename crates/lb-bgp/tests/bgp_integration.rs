@@ -353,3 +353,55 @@ async fn interleaved_announce_withdraw_preserves_sequence() {
     speaker.shutdown().await;
     router.stop().await;
 }
+
+#[tokio::test]
+async fn peer_notification_tears_down_session_and_emits_event() {
+    // Open a session, then have the mock router push a NOTIFICATION
+    // (Cease, subcode 2 = admin shutdown). The speaker must fire a
+    // BgpEvent::PeerNotification with the exact code/subcode before
+    // dropping the session. Reconnect behaviour is covered by a separate
+    // test (`reconnect_after_peer_drops_mid_session`).
+    use lb_bgp::BgpEvent;
+
+    let mut router = MockRouter::start().await;
+    let mut speaker = BgpSpeaker::new(config_for(&[router.addr.port()]));
+    let mut events = speaker
+        .take_event_rx()
+        .expect("event rx should be available the first time");
+    speaker.spawn(&tokio::runtime::Handle::current());
+
+    assert_eq!(
+        router.expect_event(EVENT_BUDGET).await,
+        RouterEvent::Connected
+    );
+    // Drain the PeerConnected event so the next recv on `events` is the
+    // NOTIFICATION we're about to trigger.
+    let _ = tokio::time::timeout(EVENT_BUDGET, events.recv()).await;
+
+    let code = lb_bgp::messages::error_code::CEASE;
+    let subcode = 2u8; // "Administrative Shutdown" per RFC 4486
+    let msg = lb_bgp::messages::encode_notification(code, subcode);
+    router.inject_bytes(msg.to_vec());
+
+    let deadline = tokio::time::Instant::now() + EVENT_BUDGET;
+    let (observed_code, observed_subcode) = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let evt = tokio::time::timeout(remaining, events.recv())
+            .await
+            .expect("timed out waiting for PeerNotification")
+            .expect("event channel closed");
+        if let BgpEvent::PeerNotification {
+            error_code,
+            error_subcode,
+            ..
+        } = evt
+        {
+            break (error_code, error_subcode);
+        }
+    };
+    assert_eq!(observed_code, code);
+    assert_eq!(observed_subcode, subcode);
+
+    speaker.shutdown().await;
+    router.stop().await;
+}

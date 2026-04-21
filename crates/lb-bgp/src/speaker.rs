@@ -51,10 +51,28 @@ pub enum PeerState {
 /// subscribe via [`BgpSpeaker::take_event_rx`].
 #[derive(Debug, Clone)]
 pub enum BgpEvent {
-    PeerConnected { peer_ip: IpAddr },
-    PeerDisconnected { peer_ip: IpAddr, reason: String },
-    AnnounceFailed { peer_ip: IpAddr },
-    WithdrawFailed { peer_ip: IpAddr },
+    PeerConnected {
+        peer_ip: IpAddr,
+    },
+    PeerDisconnected {
+        peer_ip: IpAddr,
+        reason: String,
+    },
+    AnnounceFailed {
+        peer_ip: IpAddr,
+    },
+    WithdrawFailed {
+        peer_ip: IpAddr,
+    },
+    /// Peer sent us a NOTIFICATION. RFC 4271 §6.3 says the session MUST be
+    /// torn down after sending or receiving one — we record the code/subcode
+    /// for operator visibility and then fall through to the transient
+    /// disconnect path.
+    PeerNotification {
+        peer_ip: IpAddr,
+        error_code: u8,
+        error_subcode: u8,
+    },
 }
 
 /// Command sent from the supervisor to a per-peer session task.
@@ -329,7 +347,10 @@ impl PeerSessionCtx {
         keepalive_interval: Duration,
     ) -> Disconnect {
         let mut ticker = time::interval_at(Instant::now() + keepalive_interval, keepalive_interval);
-        let mut read_buf = [0u8; 64];
+        let mut read_buf = [0u8; 4096];
+        // Inbound TCP bytes accumulate here; we extract whole BGP messages
+        // (they always start with the 16-byte `0xFF` marker + 2-byte length).
+        let mut incoming: Vec<u8> = Vec::with_capacity(4096);
 
         loop {
             tokio::select! {
@@ -366,10 +387,34 @@ impl PeerSessionCtx {
                 read = stream.read(&mut read_buf) => {
                     match read {
                         Ok(0) => return Disconnect::transient("peer closed connection".into()),
-                        Ok(_) => {
-                            // We accept and ignore peer-initiated messages
-                            // (KEEPALIVE, UPDATE, NOTIFICATION). A strict
-                            // parser is out of scope for the current speaker.
+                        Ok(n) => {
+                            incoming.extend_from_slice(&read_buf[..n]);
+                            // Parse as many whole messages as we have. If a
+                            // NOTIFICATION lands, emit the event and return
+                            // a transient disconnect — RFC 4271 §6.3 says
+                            // the session MUST be closed afterwards.
+                            while let Some(msg) = take_message(&mut incoming) {
+                                if let Some((code, subcode)) = messages::parse_notification(&msg) {
+                                    let _ = self.events.send(BgpEvent::PeerNotification {
+                                        peer_ip: self.peer.peer_ip,
+                                        error_code: code,
+                                        error_subcode: subcode,
+                                    });
+                                    tracing::warn!(
+                                        peer = %self.peer.peer_ip,
+                                        code,
+                                        subcode,
+                                        name = messages::notification_error_name(code),
+                                        "BGP NOTIFICATION received"
+                                    );
+                                    return Disconnect::transient(format!(
+                                        "NOTIFICATION code={code} subcode={subcode}"
+                                    ));
+                                }
+                                // Other peer-initiated messages (KEEPALIVE,
+                                // UPDATE): ignored. A strict parser is out
+                                // of scope.
+                            }
                         }
                         Err(e) => return Disconnect::transient(format!("read: {e}")),
                     }
@@ -423,6 +468,35 @@ impl Disconnect {
             terminal: false,
         }
     }
+}
+
+/// Pop one complete BGP message from the byte accumulator, or return `None`
+/// if we don't have one yet. Self-healing: if the buffer does not start on a
+/// BGP marker, we drop one byte and wait for more data, which keeps us from
+/// hanging on a mid-stream desync.
+///
+/// Bounds: rejects messages whose length header is outside `[19, 4096]`
+/// (RFC 4271 §4.1). Anything larger is almost certainly a framing error, not
+/// a legitimate UPDATE.
+fn take_message(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if buf.len() < 19 {
+        return None;
+    }
+    if buf[..16] != [0xFF; 16] {
+        buf.remove(0);
+        return None;
+    }
+    let len = u16::from_be_bytes([buf[16], buf[17]]) as usize;
+    if !(19..=4096).contains(&len) {
+        // Desync: drop a byte and wait. Returning None without consuming
+        // would loop forever.
+        buf.remove(0);
+        return None;
+    }
+    if buf.len() < len {
+        return None;
+    }
+    Some(buf.drain(..len).collect())
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use lb_forwarder::vip_matcher::VipMatcher;
 use lb_forwarder::ForwarderConfig;
 use lb_hashing::LookupTable;
 use lb_io::mock::mock_io;
-use lb_metrics::{LbMetrics, PeerLabels};
+use lb_metrics::{LbMetrics, PeerLabels, PeerNotificationLabels};
 use lb_types::{BackendPoolId, HealthStatus, NodeConfig};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -212,6 +212,20 @@ fn main() {
                             .withdraw_failures
                             .get_or_create(&PeerLabels {
                                 peer_ip: peer_ip.to_string(),
+                            })
+                            .inc();
+                    }
+                    BgpEvent::PeerNotification {
+                        peer_ip,
+                        error_code,
+                        error_subcode,
+                    } => {
+                        bgp_metrics
+                            .peer_notifications
+                            .get_or_create(&PeerNotificationLabels {
+                                peer_ip: peer_ip.to_string(),
+                                code: error_code,
+                                subcode: error_subcode,
                             })
                             .inc();
                     }

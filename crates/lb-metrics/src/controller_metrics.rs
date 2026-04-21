@@ -56,11 +56,21 @@ pub struct BgpMetrics {
     pub announce_failures: Family<PeerLabels, Counter>,
     pub withdraw_failures: Family<PeerLabels, Counter>,
     pub vips_announced: Gauge,
+    pub peer_notifications: Family<PeerNotificationLabels, Counter>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PeerLabels {
     pub peer_ip: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PeerNotificationLabels {
+    pub peer_ip: String,
+    /// BGP error code (RFC 4271 §4.5). `1`=msg header, `2`=OPEN, `3`=UPDATE,
+    /// `4`=hold-timer-expired, `5`=FSM, `6`=Cease.
+    pub code: u8,
+    pub subcode: u8,
 }
 
 impl BgpMetrics {
@@ -71,6 +81,7 @@ impl BgpMetrics {
         let announce_failures: Family<PeerLabels, Counter> = Family::default();
         let withdraw_failures: Family<PeerLabels, Counter> = Family::default();
         let vips_announced = Gauge::default();
+        let peer_notifications: Family<PeerNotificationLabels, Counter> = Family::default();
 
         registry.register(
             "lb_bgp_peer_state",
@@ -102,6 +113,11 @@ impl BgpMetrics {
             "Count of VIPs currently being announced to the fleet",
             vips_announced.clone(),
         );
+        registry.register(
+            "lb_bgp_peer_notifications_total",
+            "NOTIFICATION messages received from a peer (RFC 4271 §4.5); session is torn down after each",
+            peer_notifications.clone(),
+        );
 
         Self {
             peer_state,
@@ -110,6 +126,7 @@ impl BgpMetrics {
             announce_failures,
             withdraw_failures,
             vips_announced,
+            peer_notifications,
         }
     }
 }
