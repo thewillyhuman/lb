@@ -21,6 +21,7 @@ fn build_config(ports: &[u16]) -> BgpConfig {
                 hold_time_secs: Some(90),
                 communities: None,
                 enabled: true,
+                md5_password: None,
             })
             .collect(),
     }

@@ -73,6 +73,17 @@ pub struct BgpPeerConfig {
     pub communities: Option<Vec<String>>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// TCP-MD5 signature (RFC 2385). When set, the speaker installs a
+    /// `TCP_MD5SIG` socket option with the given password before connecting
+    /// so every TCP segment carries an MD5 signature of the header plus
+    /// payload plus peer-shared key. Max length is 80 bytes (Linux
+    /// TCP_MD5SIG_MAXKEYLEN). Linux-only; on other OSes the speaker logs a
+    /// warning and falls back to plain TCP.
+    ///
+    /// *Treat the config file as a secret* — anyone with read access can
+    /// impersonate this peer.
+    #[serde(default)]
+    pub md5_password: Option<String>,
 }
 
 fn default_bgp_port() -> u16 {
@@ -130,6 +141,7 @@ impl<'de> Deserialize<'de> for BgpConfig {
                 hold_time_secs: None,
                 communities: None,
                 enabled: true,
+                md5_password: None,
             }],
             (None, None, None) => {
                 return Err(serde::de::Error::custom(
@@ -511,6 +523,24 @@ peer_ip = "10.0.0.254"
 "#;
         let err = toml::from_str::<BgpConfig>(toml_str).unwrap_err();
         assert!(err.to_string().contains("peer_ip"));
+    }
+
+    #[test]
+    fn bgp_accepts_per_peer_md5_password() {
+        let toml_str = r#"
+local_asn = 65000
+router_id = "10.0.0.1"
+[[peers]]
+peer_ip = "10.0.0.254"
+peer_asn = 65000
+md5_password = "s3cret"
+[[peers]]
+peer_ip = "10.0.0.253"
+peer_asn = 65000
+"#;
+        let cfg: BgpConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.peers[0].md5_password.as_deref(), Some("s3cret"));
+        assert_eq!(cfg.peers[1].md5_password, None);
     }
 
     #[test]

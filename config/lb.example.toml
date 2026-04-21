@@ -29,6 +29,7 @@ peer_asn        = 65000
 # hold_time_secs  = 90
 # communities     = ["65000:200"]
 # enabled         = true
+# md5_password    = "s3cret"    # RFC 2385 TCP-MD5 auth, Linux-only; file becomes a secret
 
 [control_plane]
 config_file     = "/etc/lb/lb-config.json"   # LB config (VIPs + pools), watched via inotify (ADR-001)
