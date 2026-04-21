@@ -30,6 +30,8 @@ pub enum RouterEvent {
     Withdrawn { vip: Ipv4Addr },
     /// KEEPALIVE received (not the initial one — that's rolled into Connected).
     Keepalive,
+    /// NOTIFICATION received from the speaker.
+    Notification { code: u8, subcode: u8 },
     /// Peer closed the TCP connection gracefully (EOF).
     Disconnected,
 }
@@ -145,7 +147,9 @@ impl MockRouter {
 #[derive(Debug, Clone)]
 pub struct MockRouterOptions {
     /// Hold time to advertise in the mock router's OPEN reply. The speaker
-    /// will pick min(its_hold, ours) and derive keepalive = hold/3.
+    /// picks `min(our_hold, peer_hold)` per RFC 4271 §4.2 and derives both
+    /// the keepalive cadence (`hold / 3`) and the hold-timer deadline from
+    /// that value.
     pub our_hold_time_secs: u16,
     /// If true, send an OPEN reply and KEEPALIVE; if false, accept and hang
     /// (useful for testing the speaker's handshake timeout).
@@ -153,6 +157,11 @@ pub struct MockRouterOptions {
     /// Close the TCP connection right after the OPEN handshake — useful for
     /// exercising reconnect/backoff paths.
     pub disconnect_after_handshake: bool,
+    /// After the handshake, stop responding on this socket entirely: no
+    /// keepalives, no echoes. Used to exercise the speaker's hold-timer
+    /// enforcement. The accept loop still listens for `inject_bytes` but
+    /// ignores everything the speaker sends.
+    pub go_silent_after_handshake: bool,
 }
 
 impl Default for MockRouterOptions {
@@ -161,6 +170,7 @@ impl Default for MockRouterOptions {
             our_hold_time_secs: 90,
             reply_to_open: true,
             disconnect_after_handshake: false,
+            go_silent_after_handshake: false,
         }
     }
 }
@@ -307,6 +317,11 @@ fn emit_message_event(msg: &[u8], events: &mpsc::UnboundedSender<RouterEvent>) {
     match messages::parse_message_type(msg) {
         Some(messages::BgpMessageType::Keepalive) => {
             let _ = events.send(RouterEvent::Keepalive);
+        }
+        Some(messages::BgpMessageType::Notification) => {
+            if let Some((code, subcode)) = messages::parse_notification(msg) {
+                let _ = events.send(RouterEvent::Notification { code, subcode });
+            }
         }
         Some(messages::BgpMessageType::Update) => {
             // Body starts at byte 19 (marker + length + type = 19 bytes).
