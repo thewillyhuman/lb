@@ -248,8 +248,7 @@ impl PeerSessionCtx {
 
     async fn run(self, mut rx: mpsc::UnboundedReceiver<SessionCmd>) {
         let mut backoff = RECONNECT_BACKOFF_MIN;
-        let hold_time = self.peer.hold_time_secs.unwrap_or(DEFAULT_HOLD_TIME_SECS);
-        let keepalive_interval = Duration::from_secs((hold_time / 3).max(1) as u64);
+        let our_hold = self.peer.hold_time_secs.unwrap_or(DEFAULT_HOLD_TIME_SECS);
 
         loop {
             // Drain any queued commands: a shutdown should win over a reconnect
@@ -267,15 +266,22 @@ impl PeerSessionCtx {
             }
 
             self.set_state(PeerState::Connecting);
-            match self.connect(hold_time).await {
-                Ok(stream) => {
+            match self.connect(our_hold).await {
+                Ok((stream, negotiated_hold)) => {
                     backoff = RECONNECT_BACKOFF_MIN;
                     self.set_state(PeerState::Established);
                     let _ = self.events.send(BgpEvent::PeerConnected {
                         peer_ip: self.peer.peer_ip,
                     });
 
-                    let shutdown = self.drive(stream, &mut rx, keepalive_interval).await;
+                    tracing::info!(
+                        peer = %self.peer.peer_ip,
+                        our_hold,
+                        negotiated_hold,
+                        "BGP hold time negotiated"
+                    );
+
+                    let shutdown = self.drive(stream, &mut rx, negotiated_hold).await;
                     let _ = self.events.send(BgpEvent::PeerDisconnected {
                         peer_ip: self.peer.peer_ip,
                         reason: shutdown.reason.clone(),
@@ -307,7 +313,11 @@ impl PeerSessionCtx {
         }
     }
 
-    async fn connect(&self, hold_time: u16) -> Result<TcpStream, BgpError> {
+    /// Complete the OPEN handshake and return the live stream plus the
+    /// **negotiated** hold time (seconds). Per RFC 4271 §4.2, the accepted
+    /// hold time is `min(our_hold, peer_hold)`. A negotiated value of `0`
+    /// disables both keepalive generation and hold-timer enforcement.
+    async fn connect(&self, our_hold: u16) -> Result<(TcpStream, u16), BgpError> {
         let peer_addr = SocketAddr::new(self.peer.peer_ip, self.peer.port);
 
         let mut stream = time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer_addr))
@@ -315,7 +325,7 @@ impl PeerSessionCtx {
             .map_err(|_| BgpError::Timeout)?
             .map_err(BgpError::Io)?;
 
-        let open = messages::encode_open(self.local_asn, hold_time, self.router_id);
+        let open = messages::encode_open(self.local_asn, our_hold, self.router_id);
         stream.write_all(&open).await?;
 
         let mut buf = vec![0u8; 4096];
@@ -332,27 +342,58 @@ impl PeerSessionCtx {
             }
         }
 
+        let peer_hold = messages::parse_open_hold_time(&buf[..n]).ok_or_else(|| {
+            BgpError::Session("peer OPEN was malformed; missing hold_time".into())
+        })?;
+        let negotiated = our_hold.min(peer_hold);
+
         let keepalive = messages::encode_keepalive();
         stream.write_all(&keepalive).await?;
 
-        tracing::info!(peer = %peer_addr, "BGP session established");
-        Ok(stream)
+        tracing::info!(peer = %peer_addr, negotiated, "BGP session established");
+        Ok((stream, negotiated))
     }
 
     /// Pump commands + keepalives until the session dies or shutdown arrives.
+    ///
+    /// `negotiated_hold` is the RFC-4271-negotiated hold time in seconds
+    /// (`min(our_hold, peer_hold)`). Zero means the peer disabled the
+    /// keepalive regime — we neither send KEEPALIVEs nor enforce a hold
+    /// timer against them. Non-zero enables both: keepalives fire at
+    /// `hold / 3`, and if we see no inbound bytes for `hold` seconds we
+    /// emit a Hold Timer Expired NOTIFICATION and drop the session.
     async fn drive(
         &self,
         mut stream: TcpStream,
         rx: &mut mpsc::UnboundedReceiver<SessionCmd>,
-        keepalive_interval: Duration,
+        negotiated_hold: u16,
     ) -> Disconnect {
+        let keepalives_enabled = negotiated_hold > 0;
+        let keepalive_interval = if keepalives_enabled {
+            Duration::from_secs((negotiated_hold / 3).max(1) as u64)
+        } else {
+            // A never-firing interval; select! will just never take this arm.
+            Duration::from_secs(u64::MAX / 2)
+        };
+        let hold_deadline = |since: Instant| {
+            if keepalives_enabled {
+                since + Duration::from_secs(negotiated_hold as u64)
+            } else {
+                // Effectively never.
+                Instant::now() + Duration::from_secs(u64::MAX / 2)
+            }
+        };
+
         let mut ticker = time::interval_at(Instant::now() + keepalive_interval, keepalive_interval);
         let mut read_buf = [0u8; 4096];
         // Inbound TCP bytes accumulate here; we extract whole BGP messages
         // (they always start with the 16-byte `0xFF` marker + 2-byte length).
         let mut incoming: Vec<u8> = Vec::with_capacity(4096);
+        let mut last_inbound = Instant::now();
 
         loop {
+            let hold_sleep = tokio::time::sleep_until(hold_deadline(last_inbound));
+            tokio::pin!(hold_sleep);
             tokio::select! {
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else {
@@ -388,6 +429,10 @@ impl PeerSessionCtx {
                     match read {
                         Ok(0) => return Disconnect::transient("peer closed connection".into()),
                         Ok(n) => {
+                            // Any byte of inbound traffic — KEEPALIVE, UPDATE,
+                            // or even a not-yet-complete message — resets the
+                            // hold timer per RFC 4271 §8.
+                            last_inbound = Instant::now();
                             incoming.extend_from_slice(&read_buf[..n]);
                             // Parse as many whole messages as we have. If a
                             // NOTIFICATION lands, emit the event and return
@@ -418,6 +463,24 @@ impl PeerSessionCtx {
                         }
                         Err(e) => return Disconnect::transient(format!("read: {e}")),
                     }
+                }
+                _ = &mut hold_sleep, if keepalives_enabled => {
+                    // Peer has been silent for `negotiated_hold` seconds.
+                    // Send a Hold Timer Expired NOTIFICATION (best effort —
+                    // the session is already broken) and tear down.
+                    let msg = messages::encode_notification(
+                        messages::error_code::HOLD_TIMER_EXPIRED,
+                        0,
+                    );
+                    let _ = stream.write_all(&msg).await;
+                    tracing::warn!(
+                        peer = %self.peer.peer_ip,
+                        hold = negotiated_hold,
+                        "BGP hold timer expired; tearing down session"
+                    );
+                    return Disconnect::transient(format!(
+                        "hold timer expired after {negotiated_hold}s of peer silence"
+                    ));
                 }
             }
         }

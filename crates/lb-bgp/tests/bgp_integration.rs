@@ -355,6 +355,47 @@ async fn interleaved_announce_withdraw_preserves_sequence() {
 }
 
 #[tokio::test]
+async fn hold_timer_expires_and_fires_notification() {
+    // Speaker advertises hold=2s. Mock echoes OPEN with hold=90. Negotiated
+    // hold is min(2,90) = 2. Mock never sends anything else (speaker's
+    // keepalives don't reset our hold timer — only inbound bytes do), so
+    // after ~2s the speaker must emit a Hold Timer Expired NOTIFICATION.
+    let router = MockRouter::start().await;
+    let mut cfg = config_for(&[router.addr.port()]);
+    cfg.peers[0].hold_time_secs = Some(2);
+    let mut speaker = BgpSpeaker::new(cfg);
+    speaker.spawn(&tokio::runtime::Handle::current());
+
+    let mut router = router;
+    assert_eq!(
+        router.expect_event(EVENT_BUDGET).await,
+        RouterEvent::Connected
+    );
+
+    // Wait for the NOTIFICATION. Budget = negotiated hold + slack.
+    let mut skipped = Vec::new();
+    let ev = router
+        .expect_event_matching(std::time::Duration::from_secs(5), &mut skipped, |e| {
+            matches!(e, RouterEvent::Notification { .. })
+        })
+        .await;
+    match ev {
+        RouterEvent::Notification { code, subcode } => {
+            assert_eq!(
+                code,
+                lb_bgp::messages::error_code::HOLD_TIMER_EXPIRED,
+                "expected HOLD_TIMER_EXPIRED; got {code}"
+            );
+            assert_eq!(subcode, 0);
+        }
+        other => panic!("expected Notification, got {other:?}"),
+    }
+
+    speaker.shutdown().await;
+    router.stop().await;
+}
+
+#[tokio::test]
 async fn peer_notification_tears_down_session_and_emits_event() {
     // Open a session, then have the mock router push a NOTIFICATION
     // (Cease, subcode 2 = admin shutdown). The speaker must fire a

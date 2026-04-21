@@ -205,6 +205,21 @@ pub fn parse_message_length(data: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes([data[16], data[17]]))
 }
 
+/// Extract the Hold Time field (seconds) from a BGP OPEN body.
+/// The layout (after the 19-byte header) is:
+///   version (1) + asn (2) + hold_time (2) + router_id (4) + opt_params_len (1)
+/// so the hold time lives at absolute offset 22..24 in the full message.
+/// Returns `None` if `data` is not an OPEN or is truncated.
+pub fn parse_open_hold_time(data: &[u8]) -> Option<u16> {
+    if data.len() < 24 {
+        return None;
+    }
+    if !matches!(parse_message_type(data), Some(BgpMessageType::Open)) {
+        return None;
+    }
+    Some(u16::from_be_bytes([data[22], data[23]]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +314,16 @@ mod tests {
         assert_eq!(notification_error_name(4), "Hold Timer Expired");
         assert_eq!(notification_error_name(6), "Cease");
         assert_eq!(notification_error_name(99), "Unknown");
+    }
+
+    #[test]
+    fn parse_open_hold_time_round_trips() {
+        let msg = encode_open(65000, 42, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(parse_open_hold_time(&msg), Some(42));
+    }
+
+    #[test]
+    fn parse_open_hold_time_rejects_non_open() {
+        assert_eq!(parse_open_hold_time(&encode_keepalive()), None);
     }
 }
