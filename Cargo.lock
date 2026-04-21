@@ -879,6 +879,7 @@ dependencies = [
  "bytes",
  "criterion",
  "lb-types",
+ "libc",
  "parking_lot",
  "thiserror",
  "tokio",

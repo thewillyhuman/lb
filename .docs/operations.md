@@ -52,6 +52,7 @@ re-announces the full current VIP set to the recovered peer.
 | `hold_time_secs` | integer | `90` | Hold time advertised in OPEN; keepalive interval is `hold_time / 3` |
 | `communities` | list | inherit | Per-peer community override (falls back to `[bgp].communities` when omitted) |
 | `enabled` | bool | `true` | Disable a peer without removing it from config |
+| `md5_password` | string | -- | RFC 2385 TCP-MD5 signature key (max 80 bytes, Linux only). Segments are signed with `MD5(header \| payload \| key)`. **Treat the config file as a secret** when set. On non-Linux the speaker logs a warning and falls back to plain TCP. |
 
 Legacy single-peer form (flat `peer_ip`/`peer_asn` at the top level of
 `[bgp]`) is still accepted and silently converted to a one-element `peers`

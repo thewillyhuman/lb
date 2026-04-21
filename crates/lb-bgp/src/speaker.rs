@@ -320,7 +320,18 @@ impl PeerSessionCtx {
     async fn connect(&self, our_hold: u16) -> Result<(TcpStream, u16), BgpError> {
         let peer_addr = SocketAddr::new(self.peer.peer_ip, self.peer.port);
 
-        let mut stream = time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer_addr))
+        // Build the socket ourselves so `TCP_MD5SIG` can be installed before
+        // the SYN goes out — MD5 is a per-segment signature, so missing it on
+        // the handshake packets means the peer rejects them.
+        let tcp_sock = match self.peer.peer_ip {
+            IpAddr::V4(_) => tokio::net::TcpSocket::new_v4().map_err(BgpError::Io)?,
+            IpAddr::V6(_) => tokio::net::TcpSocket::new_v6().map_err(BgpError::Io)?,
+        };
+        if let Some(password) = self.peer.md5_password.as_deref() {
+            apply_tcp_md5sig(&tcp_sock, self.peer.peer_ip, password).map_err(BgpError::Io)?;
+        }
+
+        let mut stream = time::timeout(CONNECT_TIMEOUT, tcp_sock.connect(peer_addr))
             .await
             .map_err(|_| BgpError::Timeout)?
             .map_err(BgpError::Io)?;
@@ -533,6 +544,114 @@ impl Disconnect {
     }
 }
 
+/// Install a TCP-MD5 signature key (RFC 2385) on the socket, so every TCP
+/// segment carries an MD5(header + payload + shared_key) digest. Must be
+/// called before `connect` — the SYN itself has to be signed or the peer
+/// will drop it.
+///
+/// Linux only: `TCP_MD5SIG` is a Linux-specific option. On other OSes we
+/// log a warning and return `Ok(())` so the session still attempts plain
+/// TCP; operators who actually need MD5 auth will have already noticed
+/// their peer sessions failing to establish.
+///
+/// Max key length is 80 bytes (Linux `TCP_MD5SIG_MAXKEYLEN`). Longer keys
+/// are rejected with `InvalidInput`.
+#[cfg(target_os = "linux")]
+fn apply_tcp_md5sig(
+    sock: &tokio::net::TcpSocket,
+    peer: IpAddr,
+    password: &str,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // TCP_MD5SIG = 14 on Linux (include/uapi/linux/tcp.h). `libc` exposes it.
+    const MAX_KEYLEN: usize = 80; // TCP_MD5SIG_MAXKEYLEN
+
+    if password.len() > MAX_KEYLEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "TCP_MD5SIG password too long ({} bytes > {MAX_KEYLEN})",
+                password.len()
+            ),
+        ));
+    }
+
+    // Layout mirrors `struct tcp_md5sig` from `<linux/tcp.h>`. libc doesn't
+    // expose the struct directly (it varies slightly across libc versions)
+    // so we define it here. Total size is 216 bytes.
+    #[repr(C)]
+    struct TcpMd5Sig {
+        tcpm_addr: libc::sockaddr_storage,
+        tcpm_flags: u8,
+        tcpm_prefixlen: u8,
+        tcpm_keylen: u16,
+        __tcpm_pad: u32,
+        tcpm_key: [u8; MAX_KEYLEN],
+    }
+
+    let mut sig: TcpMd5Sig = unsafe { std::mem::zeroed() };
+
+    // Populate tcpm_addr with the peer address. IPv4 is the only form we
+    // exercise today; the rest of the forwarder is IPv4-only per H5.
+    match peer {
+        IpAddr::V4(v4) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as u16,
+                sin_port: 0,
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &sin as *const _ as *const u8,
+                    &mut sig.tcpm_addr as *mut _ as *mut u8,
+                    std::mem::size_of::<libc::sockaddr_in>(),
+                );
+            }
+        }
+        IpAddr::V6(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "TCP_MD5SIG not yet wired for IPv6 peers",
+            ));
+        }
+    }
+
+    sig.tcpm_keylen = password.len() as u16;
+    sig.tcpm_key[..password.len()].copy_from_slice(password.as_bytes());
+
+    let ret = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_MD5SIG,
+            &sig as *const _ as *const libc::c_void,
+            std::mem::size_of::<TcpMd5Sig>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    tracing::info!(%peer, "TCP_MD5SIG installed");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_tcp_md5sig(
+    _sock: &tokio::net::TcpSocket,
+    peer: IpAddr,
+    _password: &str,
+) -> std::io::Result<()> {
+    tracing::warn!(
+        %peer,
+        "TCP_MD5SIG requested but only supported on Linux; peering in plain TCP"
+    );
+    Ok(())
+}
+
 /// Pop one complete BGP message from the byte accumulator, or return `None`
 /// if we don't have one yet. Self-healing: if the buffer does not start on a
 /// BGP marker, we drop one byte and wait for more data, which keeps us from
@@ -584,6 +703,7 @@ mod tests {
                     hold_time_secs: Some(9),
                     communities: None,
                     enabled: true,
+                    md5_password: None,
                 })
                 .collect(),
         }

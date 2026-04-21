@@ -37,6 +37,7 @@ fn config_for(ports: &[u16]) -> BgpConfig {
                 hold_time_secs: Some(9),
                 communities: None,
                 enabled: true,
+                md5_password: None,
             })
             .collect(),
     }
