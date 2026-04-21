@@ -47,6 +47,54 @@ pub fn encode_keepalive() -> BytesMut {
     buf
 }
 
+/// Serialize a BGP NOTIFICATION (RFC 4271 §4.5).
+///
+/// Header (19) + error code (1) + error subcode (1). No variable data —
+/// the protocol allows it for diagnostic bytes, but every widespread
+/// implementation treats the body after the subcode as opaque, so we
+/// omit it. Peers receiving this should close the TCP session immediately.
+pub fn encode_notification(error_code: u8, error_subcode: u8) -> BytesMut {
+    let mut buf = BytesMut::new();
+    buf.put_slice(&MARKER);
+    buf.put_u16(21); // header (19) + body (2)
+    buf.put_u8(BgpMessageType::Notification as u8);
+    buf.put_u8(error_code);
+    buf.put_u8(error_subcode);
+    buf
+}
+
+/// Parse the (error_code, error_subcode) tuple from an inbound BGP
+/// NOTIFICATION message. Returns `None` if `data` is too short or not a
+/// NOTIFICATION.
+pub fn parse_notification(data: &[u8]) -> Option<(u8, u8)> {
+    if data.len() < 21 {
+        return None;
+    }
+    if !matches!(parse_message_type(data), Some(BgpMessageType::Notification)) {
+        return None;
+    }
+    Some((data[19], data[20]))
+}
+
+/// Human-readable name for a NOTIFICATION error code (RFC 4271 §4.5).
+pub fn notification_error_name(code: u8) -> &'static str {
+    match code {
+        1 => "Message Header Error",
+        2 => "OPEN Message Error",
+        3 => "UPDATE Message Error",
+        4 => "Hold Timer Expired",
+        5 => "Finite State Machine Error",
+        6 => "Cease",
+        _ => "Unknown",
+    }
+}
+
+/// Error codes we emit ourselves.
+pub mod error_code {
+    pub const HOLD_TIMER_EXPIRED: u8 = 4;
+    pub const CEASE: u8 = 6;
+}
+
 /// Serialize a BGP UPDATE message to announce an IPv4 prefix (RFC 4271 Section 4.3).
 pub fn encode_update_announce(
     prefix: Ipv4Addr,
@@ -226,5 +274,30 @@ mod tests {
         let msg = encode_keepalive();
         assert_eq!(parse_message_type(&msg), Some(BgpMessageType::Keepalive));
         assert_eq!(parse_message_length(&msg), Some(19));
+    }
+
+    #[test]
+    fn notification_round_trips() {
+        let msg = encode_notification(error_code::HOLD_TIMER_EXPIRED, 0);
+        assert_eq!(msg.len(), 21);
+        assert_eq!(parse_message_type(&msg), Some(BgpMessageType::Notification));
+        assert_eq!(
+            parse_notification(&msg),
+            Some((error_code::HOLD_TIMER_EXPIRED, 0))
+        );
+    }
+
+    #[test]
+    fn parse_notification_rejects_short_and_wrong_type() {
+        assert_eq!(parse_notification(&encode_keepalive()), None);
+        assert_eq!(parse_notification(&[0u8; 20]), None);
+    }
+
+    #[test]
+    fn notification_error_name_covers_all_rfc_codes() {
+        assert_eq!(notification_error_name(1), "Message Header Error");
+        assert_eq!(notification_error_name(4), "Hold Timer Expired");
+        assert_eq!(notification_error_name(6), "Cease");
+        assert_eq!(notification_error_name(99), "Unknown");
     }
 }

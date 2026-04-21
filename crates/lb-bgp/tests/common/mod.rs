@@ -37,6 +37,11 @@ pub enum RouterEvent {
 pub struct MockRouter {
     pub addr: SocketAddr,
     events: mpsc::UnboundedReceiver<RouterEvent>,
+    /// Bytes the test wants the mock router to inject onto the currently-open
+    /// session. The accept loop forwards whatever arrives here straight out
+    /// the TCP socket. Used for exercising the speaker's response to peer-
+    /// initiated NOTIFICATION and similar.
+    inject: mpsc::UnboundedSender<Vec<u8>>,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
@@ -51,16 +56,24 @@ impl MockRouter {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (inject_tx, inject_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (stop_tx, stop_rx) = oneshot::channel();
 
-        let task = tokio::spawn(run_router(listener, opts, events_tx, stop_rx));
+        let task = tokio::spawn(run_router(listener, opts, events_tx, inject_rx, stop_rx));
 
         MockRouter {
             addr,
             events: events_rx,
+            inject: inject_tx,
             stop: Some(stop_tx),
             task: Some(task),
         }
+    }
+
+    /// Push raw bytes into the currently-open session. The accept loop
+    /// forwards them verbatim to the speaker. Fire-and-forget.
+    pub fn inject_bytes(&self, bytes: Vec<u8>) {
+        let _ = self.inject.send(bytes);
     }
 
     /// Await the next event with a per-call timeout. Panics on timeout so the
@@ -156,8 +169,14 @@ async fn run_router(
     listener: TcpListener,
     opts: MockRouterOptions,
     events: mpsc::UnboundedSender<RouterEvent>,
+    inject_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     mut stop: oneshot::Receiver<()>,
 ) {
+    // Share the inject receiver across all connection tasks. Only one
+    // connection has it at a time (we lock across accepts); this is fine
+    // because every test scenario opens at most one connection per
+    // `MockRouter`.
+    let inject = std::sync::Arc::new(tokio::sync::Mutex::new(inject_rx));
     loop {
         let accept = tokio::select! {
             r = listener.accept() => r,
@@ -168,11 +187,10 @@ async fn run_router(
             Err(_) => continue,
         };
 
-        // Per-connection handling. Each connection runs the handshake then
-        // streams parsed BGP messages as events.
         let ev = events.clone();
         let opts = opts.clone();
-        tokio::spawn(handle_connection(stream, opts, ev));
+        let inject = std::sync::Arc::clone(&inject);
+        tokio::spawn(handle_connection(stream, opts, ev, inject));
     }
 }
 
@@ -180,6 +198,7 @@ async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     opts: MockRouterOptions,
     events: mpsc::UnboundedSender<RouterEvent>,
+    inject: std::sync::Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>>,
 ) {
     let mut incoming = ByteAccumulator::new();
     let mut buf = [0u8; 4096];
@@ -243,24 +262,44 @@ async fn handle_connection(
         return;
     }
 
-    // Main loop: decode any BGP message arriving on the stream.
+    // Main loop: decode any BGP message arriving on the stream *and* forward
+    // any bytes the test wants to inject into the session (via
+    // `MockRouter::inject_bytes`).
+    let mut inject_guard = inject.lock().await;
     loop {
-        // Drain anything already parsed.
         while let Some(m) = incoming.next_message() {
             emit_message_event(&m, &events);
         }
-        let n = match stream.read(&mut buf).await {
-            Ok(0) => {
-                let _ = events.send(RouterEvent::Disconnected);
-                return;
+        tokio::select! {
+            read = stream.read(&mut buf) => {
+                match read {
+                    Ok(0) => {
+                        let _ = events.send(RouterEvent::Disconnected);
+                        return;
+                    }
+                    Ok(n) => {
+                        incoming.extend(&buf[..n]);
+                    }
+                    Err(_) => {
+                        let _ = events.send(RouterEvent::Disconnected);
+                        return;
+                    }
+                }
             }
-            Ok(n) => n,
-            Err(_) => {
-                let _ = events.send(RouterEvent::Disconnected);
-                return;
+            injected = inject_guard.recv() => {
+                match injected {
+                    Some(bytes) => {
+                        if stream.write_all(&bytes).await.is_err() {
+                            let _ = events.send(RouterEvent::Disconnected);
+                            return;
+                        }
+                    }
+                    None => {
+                        // Inject channel closed — test is shutting down.
+                    }
+                }
             }
-        };
-        incoming.extend(&buf[..n]);
+        }
     }
 }
 
