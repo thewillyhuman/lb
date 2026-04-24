@@ -8,7 +8,6 @@ license.workspace = true
 default = ["mock"]
 mock = ["dep:crossbeam"]
 af-xdp = ["dep:libbpf-sys", "dep:libc"]
-dpdk = ["dep:libc"]
 
 [dependencies]
 libbpf-sys = { workspace = true, optional = true }

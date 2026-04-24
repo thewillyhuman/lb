@@ -6,9 +6,6 @@ pub mod mock;
 #[cfg(feature = "af-xdp")]
 pub mod af_xdp;
 
-#[cfg(feature = "dpdk")]
-pub mod dpdk;
-
 /// Maximum packet buffer size (accommodates jumbo frames + GRE overhead).
 pub const PACKET_BUF_SIZE: usize = 2048;
 
