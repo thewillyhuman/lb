@@ -150,8 +150,7 @@ lb/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs                  # PacketIo trait
-│   │       ├── af_xdp.rs              # AF_XDP implementation via aya
-│   │       ├── dpdk.rs                 # DPDK implementation (feature-gated)
+│   │       ├── af_xdp.rs               # AF_XDP scaffold (feature-gated; scaffold only — XSK ring impl is a planned follow-up)
 │   │       └── mock.rs                 # In-memory packet I/O for testing
 │   │
 │   │  ─────────────────────────────────
@@ -382,9 +381,8 @@ Three implementations:
 
 | Implementation | Crate feature | Use case |
 |---|---|---|
-| `AfXdpIo` | `af-xdp` (default) | Production. Safe Rust eBPF/XDP via `aya`; no kernel modification; works with standard NICs. |
-| `DpdkIo` | `dpdk` | Optional. Higher throughput if AF_XDP proves insufficient, at the cost of NIC vendor dependency. |
-| `MockIo` | `mock` (test only) | Integration tests. In-memory ring buffers, deterministic, no root required. |
+| `AfXdpIo` | `af-xdp` | Strategic direction for production. **Currently a scaffold** — `new()` returns `Err(Unsupported)` until the XSK ring implementation lands (see roadmap comment in `crates/lb-io/src/af_xdp.rs`). |
+| `MockIo` | `mock` (default, test only) | In-memory ring buffers, deterministic, no root required. What integration tests and the default build use today. |
 
 The forwarder is generic over `PacketIo` and is constructed as `ForwarderEngine<T: PacketIo>`. This means all forwarding logic is testable without hardware.
 

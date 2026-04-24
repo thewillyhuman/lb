@@ -13,8 +13,7 @@ For kernel bypass packet I/O, additional dependencies are needed depending on th
 
 | Backend | Feature flag | Dependencies |
 |---------|-------------|--------------|
-| AF_XDP | `af-xdp` | Linux >= 4.18, libbpf headers, `CAP_NET_ADMIN` |
-| DPDK | `dpdk` | DPDK libraries (libdpdk), hugepages, VFIO/UIO driver |
+| AF_XDP | `af-xdp` | Linux >= 4.18, libbpf headers, `CAP_NET_ADMIN`. The backend is currently a scaffold and returns `Err(Unsupported)` at init — a proper XSK-ring implementation is planned; see the roadmap note in `crates/lb-io/src/af_xdp.rs` |
 
 ## Building from source
 
@@ -34,11 +33,7 @@ Binaries are at:
 cargo build --release --features lb-io/af-xdp
 ```
 
-### With DPDK support (Linux)
-
-```bash
-cargo build --release --features lb-io/dpdk
-```
+> The DPDK backend was removed (see PR 4 / commit removing `crates/lb-io/src/dpdk.rs`). Strategic direction is AF_XDP only — kernel-native, no userspace SDK toolchain.
 
 ## Cross-compilation (static binary)
 
