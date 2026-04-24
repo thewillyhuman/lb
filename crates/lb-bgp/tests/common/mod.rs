@@ -297,16 +297,17 @@ async fn handle_connection(
                 }
             }
             injected = inject_guard.recv() => {
-                match injected {
-                    Some(bytes) => {
-                        if stream.write_all(&bytes).await.is_err() {
-                            let _ = events.send(RouterEvent::Disconnected);
-                            return;
-                        }
-                    }
-                    None => {
-                        // Inject channel closed — test is shutting down.
-                    }
+                // Some(bytes): forward to the peer; if the write fails, the
+                // session is done.
+                // None: inject channel closed — test is tearing down; fall
+                // through and let the next `stream.read` observe EOF.
+                let write_failed = match injected {
+                    Some(bytes) => stream.write_all(&bytes).await.is_err(),
+                    None => false,
+                };
+                if write_failed {
+                    let _ = events.send(RouterEvent::Disconnected);
+                    return;
                 }
             }
         }
