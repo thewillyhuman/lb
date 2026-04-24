@@ -271,6 +271,46 @@ bind to loopback and scrape from a sidecar, or firewall the interface.
 | `GET /healthz` | Process is alive. Returns `200 ok`. Kubernetes-style liveness — a failing probe triggers restart, not de-pooling, so nothing gates this. |
 | `GET /readyz` | Returns `200 ok` iff the initial config has been applied *and* the multi-threaded forwarder is still running. Returns `503` otherwise. Use as the load-balancer / systemd-notify readiness signal. |
 
+### Packet tracing
+
+The ops server exposes a read-only tracer at `POST /v1/trace`. Send it a
+5-tuple as JSON and it tells you which backend a matching packet would be
+sent to, without injecting anything on the wire:
+
+```bash
+curl -s http://127.0.0.1:9100/v1/trace \
+     -H 'Content-Type: application/json' \
+     -d '{"src_ip":"10.0.0.100","src_port":12345,
+          "dst_ip":"188.184.100.10","dst_port":443,
+          "protocol":"Tcp"}'
+```
+
+Response (abbreviated):
+
+```json
+{
+  "node_id": "lb-node-01",
+  "pool_id": "web",
+  "flow_hash": 4919583209831287808,
+  "selected_backend": "10.0.0.2",
+  "backend_healthy": true,
+  "steps": ["parsed 5-tuple: ...", "VIP matched → pool `web`", ...]
+}
+```
+
+The `lb-trace` CLI wraps the endpoint:
+
+```bash
+lb-trace --node http://127.0.0.1:9100 \
+         --src 10.0.0.100:12345 --dst 188.184.100.10:443
+```
+
+The tracer reads the VIP matcher, Maglev lookup tables, and health map —
+the same shared state the hot path uses — but *not* the per-thread
+connection table (which would drift between rewriter threads). The answer
+is therefore the steady-state Maglev decision, which is what you usually
+want when debugging VIP config or health flaps.
+
 ### Logs
 
 Structured JSON is the default format, suitable for journald → Loki /
@@ -360,7 +400,15 @@ Deploy LB nodes behind an ECMP router. The router distributes traffic evenly acr
 
 - Check health status -- an unhealthy backend is excluded from the lookup table.
 - Check that the backend can decapsulate GRE (IP protocol 47) and that its loopback interface has the VIP address configured for DSR.
-- Verify GRE connectivity: `ping -I <lb-node-ip> <backend-ip>` (or use `lb-trace` for packet tracing).
+- Verify GRE connectivity: `ping -I <lb-node-ip> <backend-ip>`.
+- Ask the node which backend it *thinks* a given 5-tuple maps to, without injecting anything:
+
+  ```bash
+  lb-trace --node http://127.0.0.1:9100 \
+           --src 10.0.0.100:12345 --dst 188.184.100.10:443
+  ```
+
+  The CLI hits `POST /v1/trace` on the ops HTTP server and prints the decision trail (VIP match → pool → Maglev selection → health status). Add `--json` for machine-readable output. Can also be invoked with `curl` directly; see the `/v1/trace` endpoint below.
 
 ### High latency
 
