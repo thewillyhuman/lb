@@ -7,6 +7,7 @@ pub mod packet_pool;
 pub mod rewriter;
 pub mod steering;
 pub mod threading;
+pub mod tracer;
 pub mod vip_matcher;
 
 use lb_hashing::LookupTable;
