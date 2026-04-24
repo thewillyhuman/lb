@@ -25,6 +25,8 @@ The LB node uses two configuration files:
 | `loopback_ip` | string | -- | Node's stable IP, used as GRE outer source |
 | `data_iface` | string | -- | NIC used for packet forwarding |
 | `num_threads` | integer | `7` | Number of packet rewriter threads |
+| `metrics_addr` | string | `127.0.0.1:9100` | Bind address for `/healthz`, `/readyz`, `/metrics`. Use `0.0.0.0:9100` for cross-host scrape |
+| `io_backend` | string | `mock` | `"mock"` (in-memory queues, dev/test) or `"af_xdp"` (production direction; scaffold today — returns `Unsupported` at startup) |
 
 #### `[bgp]`
 

@@ -28,6 +28,28 @@ pub struct NodeSection {
     /// for cross-host scraping.
     #[serde(default = "default_metrics_addr")]
     pub metrics_addr: SocketAddr,
+    /// Which `PacketIo` backend the forwarder uses. `"mock"` is the default
+    /// (in-memory queues, useful for local dev and integration tests).
+    /// `"af_xdp"` is the strategic production path but currently returns
+    /// `Unsupported` at init — see `crates/lb-io/src/af_xdp.rs` for the
+    /// roadmap. Anything else is a config error.
+    #[serde(default)]
+    pub io_backend: IoBackend,
+}
+
+/// Packet I/O backend selector. Kept as a small enum (not a free-form
+/// string) so serde rejects typos at config-load time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IoBackend {
+    /// In-memory ring buffers; no real NIC traffic. The default, suitable
+    /// for local dev and integration tests.
+    #[default]
+    Mock,
+    /// AF_XDP socket bound to `data_iface`. Production direction. Currently
+    /// a scaffold — instantiating this errors at startup with a message
+    /// pointing at the roadmap.
+    AfXdp,
 }
 
 fn default_num_threads() -> usize {
@@ -479,6 +501,45 @@ data_iface = "eth0"
         let section: NodeSection = toml::from_str(toml_str).unwrap();
         assert_eq!(section.metrics_addr.port(), 9100);
         assert!(section.metrics_addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn io_backend_defaults_to_mock() {
+        let toml_str = r#"
+id = "node"
+loopback_ip = "10.0.0.1"
+data_iface = "eth0"
+"#;
+        let section: NodeSection = toml::from_str(toml_str).unwrap();
+        assert_eq!(section.io_backend, IoBackend::Mock);
+    }
+
+    #[test]
+    fn io_backend_accepts_af_xdp_variant() {
+        let toml_str = r#"
+id = "node"
+loopback_ip = "10.0.0.1"
+data_iface = "eth0"
+io_backend = "af_xdp"
+"#;
+        let section: NodeSection = toml::from_str(toml_str).unwrap();
+        assert_eq!(section.io_backend, IoBackend::AfXdp);
+    }
+
+    #[test]
+    fn io_backend_rejects_unknown_variant() {
+        let toml_str = r#"
+id = "node"
+loopback_ip = "10.0.0.1"
+data_iface = "eth0"
+io_backend = "dpdk"
+"#;
+        let err = toml::from_str::<NodeSection>(toml_str).unwrap_err();
+        // Serde's error message includes the list of known variants; assert
+        // it mentions the ones we actually expose.
+        let msg = err.to_string();
+        assert!(msg.contains("mock"), "error should list `mock`: {msg}");
+        assert!(msg.contains("af_xdp"), "error should list `af_xdp`: {msg}");
     }
 
     #[test]

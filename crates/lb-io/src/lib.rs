@@ -3,7 +3,9 @@ use std::io;
 #[cfg(feature = "mock")]
 pub mod mock;
 
-#[cfg(feature = "af-xdp")]
+// AF_XDP is always present as a scaffold (AfXdpIo::new returns Unsupported);
+// the `af-xdp` feature flag reserves space for the libbpf-sys / libxdp-sys
+// dependencies the real implementation will need in a follow-up PR.
 pub mod af_xdp;
 
 /// Maximum packet buffer size (accommodates jumbo frames + GRE overhead).

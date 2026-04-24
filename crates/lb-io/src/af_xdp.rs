@@ -183,7 +183,11 @@ mod tests {
     #[test]
     fn af_xdp_new_returns_unsupported() {
         // Works on both Linux (scaffold) and non-Linux (platform stub).
-        let err = AfXdpIo::new(&AfXdpConfig::default()).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        // `Result::unwrap_err` requires `Debug` on the Ok variant, which our
+        // `Infallible`-carrying struct does not impl; pattern-match instead.
+        match AfXdpIo::new(&AfXdpConfig::default()) {
+            Ok(_) => panic!("scaffold must return an error"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported),
+        }
     }
 }

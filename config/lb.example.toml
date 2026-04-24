@@ -7,6 +7,7 @@ loopback_ip     = "188.184.0.1"   # this node's stable IP, used as GRE source
 data_iface      = "eth0"          # NIC used for packet forwarding
 num_threads     = 7               # packet rewriter threads (leave 1 core for steering/muxing)
 metrics_addr    = "127.0.0.1:9100"  # /healthz, /readyz, /metrics; use 0.0.0.0:9100 for remote scrape
+io_backend      = "mock"          # "mock" (in-memory, dev/test) or "af_xdp" (scaffold — returns Unsupported at init for now)
 
 [bgp]
 local_asn       = 65000
