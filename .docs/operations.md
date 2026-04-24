@@ -83,7 +83,8 @@ list. It cannot be mixed with `[[bgp.peers]]` in the same file.
 |-----|------|---------|-------------|
 | `packet_pool_size` | integer | `4096` | Number of pre-allocated packet buffers |
 | `connection_table_size` | integer | `131072` | Per-thread connection table entries (power of two, >= 2x peak concurrent flows). Uses Robin Hood hashing; keep fill ratio below 50% to bound probe length |
-| `fragment_table_size` | integer | `8192` | Fragment reassembly table entries |
+| `fragment_table_size` | integer | `8192` | Per-thread IP fragment→backend map, keyed on (src, dst, ip_id). Must be a power of two |
+| `fragment_ttl` | string | `"10s"` | Time a fragment→backend mapping is kept. Non-first fragments arriving after expiry have no reassembly context and are dropped |
 | `batch_size` | integer | `64` | Packets per batch in RX/TX |
 | `batch_flush_interval` | string | `"50us"` | Max time before flushing a partial batch |
 | `connection_ttl` | string | `"60s"` | Legacy single TTL. Used as the default for `connection_ttls.tcp_established` when the section below is absent |
@@ -119,6 +120,9 @@ FIN scans, long TTL for established sessions.
 | `lb_connection_table_tcp_transitions_total` | counter | `to` ∈ `{established, closing_fin, closing_rst}` | TCP state transitions driven by observed flags |
 | `lb_connection_table_size` | gauge | -- | Current occupied entries per thread |
 | `lb_connection_table_fill_bp` | gauge | -- | Fill ratio in basis points (0–10 000, so 5000 = 50%) |
+| `lb_fragment_first_total` | counter | -- | First IP fragments seen (MF=1, offset=0); these populate the fragment table |
+| `lb_fragment_subsequent_forwarded_total` | counter | -- | Non-first fragments forwarded via a 3-tuple fragment-table lookup |
+| `lb_fragment_drop_no_mapping_total` | counter | -- | Non-first fragments dropped because no fragment-table mapping was found (first fragment never seen or entry expired) |
 
 #### `[health_check_defaults]`
 

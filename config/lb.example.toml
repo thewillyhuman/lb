@@ -38,7 +38,8 @@ local_cache     = "/var/lib/lb/config-cache.json"
 [forwarder]
 packet_pool_size       = 4096
 connection_table_size  = 131072     # per thread, must be power of two. ≥ 2× peak concurrent flows.
-fragment_table_size    = 8192
+fragment_table_size    = 8192       # per-thread; keyed on (src, dst, ip_id). Must be power of two.
+fragment_ttl           = "10s"      # time a fragment→backend mapping is kept; non-first fragments after expiry are dropped
 batch_size             = 64
 batch_flush_interval   = "50us"
 # Legacy single-TTL knob. Used as the default for tcp_established when

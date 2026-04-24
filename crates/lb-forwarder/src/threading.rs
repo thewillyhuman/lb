@@ -13,6 +13,7 @@
 //! so steering can reuse it. This mirrors AF_XDP's UMEM model.
 
 use crate::conn_table::{ConnTable, InsertResult};
+use crate::fragment_table::FragmentTable;
 use crate::gre;
 use crate::packet_pool::{FrameIndex, PacketPool};
 use crate::steering;
@@ -22,14 +23,17 @@ use crossbeam::queue::ArrayQueue;
 use lb_hashing::LookupTable;
 use lb_io::{PacketBuf, PacketIo};
 use lb_metrics::{EvictionLabels, ForwarderMetrics, TcpTransitionLabels};
+use lb_types::packet;
 use lb_types::{
-    BackendPoolId, ConnTtls, FlowProto, HealthStatus, PacketMeta, TcpFlags, TcpFlowState,
+    BackendPoolId, ConnTtls, FlowProto, FragmentId, HealthStatus, PacketMeta, TcpFlags,
+    TcpFlowState,
 };
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -137,6 +141,8 @@ impl MultiThreadedForwarder {
                 src_ip: config.src_ip,
                 conn_table_size: config.connection_table_size,
                 conn_ttls: config.conn_ttls,
+                fragment_table_size: config.fragment_table_size,
+                fragment_ttl: config.fragment_ttl,
                 lookup_tables: lookup_tables.clone(),
                 vip_matcher: Arc::clone(&vip_matcher),
                 health_status: Arc::clone(&health_status),
@@ -245,6 +251,8 @@ struct RewriterContext {
     src_ip: IpAddr,
     conn_table_size: usize,
     conn_ttls: ConnTtls,
+    fragment_table_size: usize,
+    fragment_ttl: Duration,
     lookup_tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
     vip_matcher: Arc<ArcSwap<VipMatcher>>,
     health_status: Arc<DashMap<IpAddr, HealthStatus>>,
@@ -254,6 +262,7 @@ struct RewriterContext {
 /// Rewriter loop: drain frame indices from RX queue, process in-place, push to TX queue.
 fn run_rewriter(ctx: RewriterContext, shutdown: &AtomicBool) {
     let mut conn_table = ConnTable::new(ctx.conn_table_size, ctx.conn_ttls);
+    let mut fragment_table = FragmentTable::new(ctx.fragment_table_size, ctx.fragment_ttl);
     let mut indices = Vec::with_capacity(BATCH_DRAIN_SIZE);
     let mut spin_count = 0u32;
 
@@ -290,6 +299,46 @@ fn run_rewriter(ctx: RewriterContext, shutdown: &AtomicBool) {
             ctx.metrics.packets_received.inc();
 
             let frame = ctx.pool.get_mut(idx);
+
+            // Non-first fragment fast path: no L4 header present, so pin the
+            // backend by looking up the 3-tuple in the fragment table. If the
+            // first fragment's entry has expired or was dropped, we have no
+            // way to reassemble — drop.
+            if packet::is_non_first_fragment(frame.as_slice()) {
+                let backend_ip = match FragmentId::from_ipv4_bytes(frame.as_slice())
+                    .and_then(|fid| fragment_table.get(fid.fragment_hash(), now))
+                {
+                    Some(ip) => ip,
+                    None => {
+                        ctx.metrics.fragment_drop_no_mapping_total.inc();
+                        ctx.metrics.packets_dropped.inc();
+                        ctx.pool.free(idx);
+                        continue;
+                    }
+                };
+                let dst_ipv4 = match backend_ip {
+                    IpAddr::V4(v4) => v4,
+                    _ => {
+                        ctx.metrics.packets_dropped.inc();
+                        ctx.pool.free(idx);
+                        continue;
+                    }
+                };
+                if let Some(new_len) =
+                    gre::encapsulate_ipv4_buf(&mut frame.data, frame.len, src_ipv4, dst_ipv4)
+                {
+                    frame.len = new_len;
+                    ctx.metrics.fragment_subsequent_forwarded_total.inc();
+                    ctx.metrics.packets_forwarded.inc();
+                    if ctx.tx_q.push(idx).is_err() {
+                        ctx.pool.free(idx);
+                    }
+                } else {
+                    ctx.metrics.packets_dropped.inc();
+                    ctx.pool.free(idx);
+                }
+                continue;
+            }
 
             // Parse 5-tuple
             let meta = match PacketMeta::from_ipv4_bytes(frame.as_slice()) {
@@ -370,6 +419,17 @@ fn run_rewriter(ctx: RewriterContext, shutdown: &AtomicBool) {
 
             if let Some(flags) = meta.tcp_flags {
                 apply_tcp_transitions(&mut conn_table, &ctx.metrics, flow_hash, flags, now);
+            }
+
+            // First fragment (MF=1, offset=0): record the 3-tuple → backend
+            // mapping so subsequent fragments reach the same pool member.
+            // `is_fragment` would also match non-first fragments, but those
+            // took the short-circuit branch above.
+            if packet::is_fragment(frame.as_slice()) {
+                if let Some(fid) = FragmentId::from_ipv4_bytes(frame.as_slice()) {
+                    fragment_table.insert(fid.fragment_hash(), backend_ip, now);
+                    ctx.metrics.fragment_first_total.inc();
+                }
             }
 
             let dst_ipv4 = match backend_ip {
@@ -598,6 +658,8 @@ mod tests {
             src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
             connection_table_size: 64,
             conn_ttls: ConnTtls::with_established(Duration::from_secs(60)),
+            fragment_table_size: 64,
+            fragment_ttl: Duration::from_secs(10),
             batch_size: 64,
             mtu_config: lb_types::MtuConfig::new(1500).unwrap(),
             icmp_rate_limit: 100,
@@ -677,6 +739,8 @@ mod tests {
             src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
             connection_table_size: 64,
             conn_ttls: ConnTtls::with_established(Duration::from_secs(60)),
+            fragment_table_size: 64,
+            fragment_ttl: Duration::from_secs(10),
             batch_size: 64,
             mtu_config: lb_types::MtuConfig::new(1500).unwrap(),
             icmp_rate_limit: 100,

@@ -184,6 +184,16 @@ pub struct ForwarderConfig {
     pub connection_table_size: usize,
     #[serde(default = "default_fragment_table_size")]
     pub fragment_table_size: usize,
+    /// Time an IP-fragment → backend mapping is kept. A non-first fragment
+    /// that arrives after this window expires is dropped (its 5-tuple can't
+    /// be recovered without the first fragment's L4 header). Defaults to
+    /// the RFC 791 reassembly timeout of 30 seconds; for a datacentre with
+    /// sub-ms reordering 10s is more typical.
+    #[serde(
+        default = "default_fragment_ttl",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub fragment_ttl: Duration,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     #[serde(deserialize_with = "deserialize_duration")]
@@ -293,6 +303,9 @@ fn default_connection_table_size() -> usize {
 }
 fn default_fragment_table_size() -> usize {
     8192
+}
+fn default_fragment_ttl() -> Duration {
+    Duration::from_secs(10)
 }
 fn default_batch_size() -> usize {
     64
