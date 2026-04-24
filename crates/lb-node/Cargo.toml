@@ -13,6 +13,7 @@ lb-hashing = { workspace = true }
 lb-metrics = { workspace = true }
 lb-io = { workspace = true }
 lb-bgp = { workspace = true }
+lb-tracer = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
@@ -22,3 +23,6 @@ tracing-subscriber = { workspace = true }
 arc-swap = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

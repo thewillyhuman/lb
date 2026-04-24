@@ -263,6 +263,10 @@ fn main() {
         io_backend = ?config.node.io_backend,
         "starting multi-threaded forwarder"
     );
+    // Clone the lookup-table map before handing it to the forwarder: the
+    // ops HTTP server's `/v1/trace` endpoint also needs read access, and
+    // the forwarder consumes its copy.
+    let lookup_tables_for_ops = Arc::new(lookup_tables.clone());
     let shared = ForwarderSharedState {
         lookup_tables,
         vip_matcher: vip_matcher.clone(),
@@ -314,6 +318,10 @@ fn main() {
                 let f = Arc::clone(&forwarder);
                 Arc::new(move || f.is_running())
             },
+            node_id: Arc::from(config.node.id.as_str()),
+            vip_matcher: Arc::clone(&vip_matcher),
+            lookup_tables: Arc::clone(&lookup_tables_for_ops),
+            health_status: Arc::clone(&health_status),
         };
         let ops_addr = config.node.metrics_addr;
         bgp_handle.spawn(async move {
