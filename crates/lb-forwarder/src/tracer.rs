@@ -134,13 +134,10 @@ mod tests {
     use lb_types::{Backend, Protocol};
     use std::net::Ipv4Addr;
 
-    fn with_pool(
-        pool_id: &str,
-        backends: Vec<Backend>,
-    ) -> (
-        HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
-        Arc<ArcSwap<VipMatcher>>,
-    ) {
+    type Tables = HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>;
+    type Matcher = Arc<ArcSwap<VipMatcher>>;
+
+    fn with_pool(pool_id: &str, backends: Vec<Backend>) -> (Tables, Matcher) {
         let lookup = LookupTable::build(&backends, 17).unwrap();
         let mut tables = HashMap::new();
         let id = BackendPoolId(pool_id.into());
