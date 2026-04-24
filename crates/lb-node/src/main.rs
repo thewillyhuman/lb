@@ -245,6 +245,8 @@ fn main() {
         src_ip: config.node.loopback_ip,
         connection_table_size: config.forwarder.connection_table_size,
         conn_ttls: config.forwarder.resolved_conn_ttls(),
+        fragment_table_size: config.forwarder.fragment_table_size,
+        fragment_ttl: config.forwarder.fragment_ttl,
         batch_size: config.forwarder.batch_size,
         mtu_config,
         icmp_rate_limit: config.forwarder.icmp_rate_limit,

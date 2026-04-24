@@ -28,6 +28,11 @@ pub struct ForwarderMetrics {
     pub icmp_frag_needed_sent_total: Counter,
     pub icmp_frag_needed_ratelimited_total: Counter,
     pub packets_oversized_dropped_total: Counter,
+    // IP fragment handling (Maglev paper §3.4: fragment table keyed by
+    // 3-tuple so non-first fragments reach the same backend).
+    pub fragment_first_total: Counter,
+    pub fragment_subsequent_forwarded_total: Counter,
+    pub fragment_drop_no_mapping_total: Counter,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -59,6 +64,9 @@ impl ForwarderMetrics {
         let icmp_frag_needed_sent_total = Counter::default();
         let icmp_frag_needed_ratelimited_total = Counter::default();
         let packets_oversized_dropped_total = Counter::default();
+        let fragment_first_total = Counter::default();
+        let fragment_subsequent_forwarded_total = Counter::default();
+        let fragment_drop_no_mapping_total = Counter::default();
         let conn_table_inserts_total = Counter::default();
         let conn_table_evictions_total: Family<EvictionLabels, Counter> = Family::default();
         let conn_table_tcp_transitions_total: Family<TcpTransitionLabels, Counter> =
@@ -132,6 +140,21 @@ impl ForwarderMetrics {
             packets_oversized_dropped_total.clone(),
         );
         registry.register(
+            "lb_fragment_first_total",
+            "First IP fragments seen (MF=1, offset=0) — these populate the fragment table",
+            fragment_first_total.clone(),
+        );
+        registry.register(
+            "lb_fragment_subsequent_forwarded_total",
+            "Non-first fragments forwarded by looking up the 3-tuple in the fragment table",
+            fragment_subsequent_forwarded_total.clone(),
+        );
+        registry.register(
+            "lb_fragment_drop_no_mapping_total",
+            "Non-first fragments dropped because no fragment-table mapping was found",
+            fragment_drop_no_mapping_total.clone(),
+        );
+        registry.register(
             "lb_connection_table_inserts_total",
             "Connection tracking insertions (new or reclaimed expired slot)",
             conn_table_inserts_total.clone(),
@@ -176,6 +199,9 @@ impl ForwarderMetrics {
             icmp_frag_needed_sent_total,
             icmp_frag_needed_ratelimited_total,
             packets_oversized_dropped_total,
+            fragment_first_total,
+            fragment_subsequent_forwarded_total,
+            fragment_drop_no_mapping_total,
         }
     }
 }

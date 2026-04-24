@@ -1,4 +1,5 @@
 use crate::conn_table::{ConnTable, InsertResult};
+use crate::fragment_table::FragmentTable;
 use crate::gre;
 use crate::icmp;
 use crate::mss_clamp::{self, ClampResult};
@@ -6,12 +7,15 @@ use crate::vip_matcher::VipMatcher;
 use lb_hashing::LookupTable;
 use lb_io::PacketBuf;
 use lb_metrics::{EvictionLabels, ForwarderMetrics, TcpTransitionLabels};
+use lb_types::packet;
 use lb_types::{
-    BackendPoolId, ConnTtls, FlowProto, HealthStatus, MtuConfig, PacketMeta, TcpFlags, TcpFlowState,
+    BackendPoolId, ConnTtls, FlowProto, FragmentId, HealthStatus, MtuConfig, PacketMeta, TcpFlags,
+    TcpFlowState,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -20,6 +24,7 @@ use dashmap::DashMap;
 pub struct RewriterThread {
     src_ip: IpAddr,
     conn_table: ConnTable,
+    fragment_table: FragmentTable,
     lookup_tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
     vip_matcher: Arc<ArcSwap<VipMatcher>>,
     health_status: Arc<DashMap<IpAddr, HealthStatus>>,
@@ -34,6 +39,8 @@ impl RewriterThread {
         src_ip: IpAddr,
         conn_table_size: usize,
         conn_ttls: ConnTtls,
+        fragment_table_size: usize,
+        fragment_ttl: Duration,
         lookup_tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
         vip_matcher: Arc<ArcSwap<VipMatcher>>,
         health_status: Arc<DashMap<IpAddr, HealthStatus>>,
@@ -44,6 +51,7 @@ impl RewriterThread {
         Self {
             src_ip,
             conn_table: ConnTable::new(conn_table_size, conn_ttls),
+            fragment_table: FragmentTable::new(fragment_table_size, fragment_ttl),
             lookup_tables,
             vip_matcher,
             health_status,
@@ -102,6 +110,32 @@ impl RewriterThread {
         vip_matcher: &VipMatcher,
         now: std::time::Instant,
     ) -> ProcessResult {
+        // Non-first fragment (offset > 0) has no L4 header, so PacketMeta
+        // parsing fails and we can't do VIP/Maglev — we'd drop the fragment
+        // and corrupt the flow. Instead look up the 3-tuple (src_ip, dst_ip,
+        // ip_id) in the fragment table, which the first fragment populated,
+        // and GRE-encap straight to that backend. No MSS (no TCP header),
+        // no connection-table touch, no oversized check (the IP stack
+        // already chose to fragment, and our GRE overhead applies uniformly
+        // to every fragment).
+        if packet::is_non_first_fragment(input.as_slice()) {
+            let fid = match FragmentId::from_ipv4_bytes(input.as_slice()) {
+                Some(f) => f,
+                None => return ProcessResult::Dropped,
+            };
+            let backend_ip = match self.fragment_table.get(fid.fragment_hash(), now) {
+                Some(ip) => ip,
+                None => {
+                    // First fragment hasn't arrived yet, or its entry expired
+                    // before this one. Nothing sensible to do — drop.
+                    self.metrics.fragment_drop_no_mapping_total.inc();
+                    return ProcessResult::Dropped;
+                }
+            };
+            self.metrics.fragment_subsequent_forwarded_total.inc();
+            return self.gre_encap_to(input, backend_ip);
+        }
+
         // Parse 5-tuple
         let meta = match PacketMeta::from_ipv4_bytes(input.as_slice()) {
             Some(m) => m,
@@ -176,6 +210,18 @@ impl RewriterThread {
             self.apply_tcp_transitions(flow_hash, flags, now);
         }
 
+        // First fragment (MF=1 and offset=0): record this flow's 3-tuple so
+        // subsequent fragments of the same datagram reach the same backend.
+        // `is_fragment` would also match non-first fragments, but those took
+        // the short-circuit branch above so we can't be here for them.
+        if packet::is_fragment(input.as_slice()) {
+            if let Some(fid) = FragmentId::from_ipv4_bytes(input.as_slice()) {
+                self.fragment_table
+                    .insert(fid.fragment_hash(), backend_ip, now);
+                self.metrics.fragment_first_total.inc();
+            }
+        }
+
         // Oversized check (after backend selection per spec §3.4)
         if icmp::should_generate_icmp(output.as_slice(), self.mtu_config.network_mtu) {
             if self.icmp_rate_limiter.allow(now) {
@@ -203,6 +249,28 @@ impl RewriterThread {
             _ => return ProcessResult::Dropped,
         };
 
+        if gre::encapsulate_ipv4(&mut output, src_ipv4, dst_ipv4) {
+            ProcessResult::Forwarded(output)
+        } else {
+            ProcessResult::Dropped
+        }
+    }
+
+    /// GRE-encapsulate `input` to `backend_ip` with no other rewriting. Used
+    /// by the non-first-fragment fast path, which has already resolved the
+    /// destination via the fragment table and must not touch MSS/conn_table/
+    /// ICMP (no L4 header to work with).
+    #[inline(always)]
+    fn gre_encap_to(&self, input: &PacketBuf, backend_ip: IpAddr) -> ProcessResult {
+        let src_ipv4 = match self.src_ip {
+            IpAddr::V4(v4) => v4,
+            _ => return ProcessResult::Dropped,
+        };
+        let dst_ipv4 = match backend_ip {
+            IpAddr::V4(v4) => v4,
+            _ => return ProcessResult::Dropped,
+        };
+        let mut output = input.clone();
         if gre::encapsulate_ipv4(&mut output, src_ipv4, dst_ipv4) {
             ProcessResult::Forwarded(output)
         } else {
@@ -357,6 +425,8 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
             64,
             ConnTtls::with_established(Duration::from_secs(60)),
+            64,
+            Duration::from_secs(10),
             tables,
             Arc::new(ArcSwap::from_pointee(vip_matcher)),
             Arc::new(DashMap::new()),
@@ -453,6 +523,8 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
             64,
             ttls,
+            64,
+            Duration::from_secs(10),
             tables,
             Arc::new(ArcSwap::from_pointee(vip_matcher)),
             Arc::new(DashMap::new()),
@@ -563,6 +635,8 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
             64,
             ConnTtls::with_established(Duration::from_secs(60)),
+            64,
+            Duration::from_secs(10),
             tables,
             Arc::new(ArcSwap::from_pointee(vip_matcher)),
             Arc::clone(&health),
@@ -610,6 +684,108 @@ mod tests {
         rewriter.process_batch(&mut batch);
 
         assert!(rewriter.metrics.conn_table_fill_bp.get() > 0);
+    }
+
+    /// Build the first fragment of a TCP datagram: MF=1, offset=0, carries
+    /// the TCP header so the rewriter can parse the 5-tuple and pick a
+    /// backend. Uses `ip_id` so the 3-tuple key matches the subsequent-
+    /// fragment builder.
+    fn build_first_fragment(
+        src: [u8; 4],
+        dst: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        ip_id: u16,
+    ) -> PacketBuf {
+        let mut pkt = build_tcp_packet(src, dst, src_port, dst_port);
+        let slice = pkt.as_mut_slice();
+        slice[4..6].copy_from_slice(&ip_id.to_be_bytes());
+        // MF=1 (bit 0x2000), offset=0
+        slice[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        pkt
+    }
+
+    /// Build a non-first fragment: no L4 header, offset > 0. The 3-tuple
+    /// (src_ip, dst_ip, ip_id) identifies which first-fragment's backend
+    /// entry we should inherit.
+    fn build_subsequent_fragment(src: [u8; 4], dst: [u8; 4], ip_id: u16) -> PacketBuf {
+        // 28 bytes: 20-byte IP header + 8 bytes of payload. Enough to pass
+        // `is_non_first_fragment`'s minimum-length check.
+        let mut pkt = vec![0u8; 28];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&28u16.to_be_bytes());
+        pkt[4..6].copy_from_slice(&ip_id.to_be_bytes());
+        // offset = 185 (8-byte units, so byte-offset 1480). MF=0 (last fragment).
+        pkt[6..8].copy_from_slice(&185u16.to_be_bytes());
+        pkt[8] = 64; // TTL
+        pkt[9] = 6; // protocol = TCP (carried forward from the first fragment)
+        pkt[12..16].copy_from_slice(&src);
+        pkt[16..20].copy_from_slice(&dst);
+        PacketBuf::from_slice(&pkt)
+    }
+
+    #[test]
+    fn first_fragment_populates_table_and_subsequent_inherits_backend() {
+        let mut rewriter = setup_rewriter();
+
+        // First fragment goes through the full pipeline.
+        let first = build_first_fragment([10, 0, 0, 5], [188, 184, 100, 10], 12345, 443, 0x4242);
+        let mut batch = vec![first];
+        let n = rewriter.process_batch(&mut batch);
+        assert_eq!(n, 1);
+        assert_eq!(rewriter.metrics.fragment_first_total.get(), 1);
+
+        // Non-first fragment of the same datagram must be forwarded via the
+        // fragment table (no MSS, no conn_table touch) and land on *some*
+        // backend — we don't assert which one, but it must not drop.
+        let second = build_subsequent_fragment([10, 0, 0, 5], [188, 184, 100, 10], 0x4242);
+        let mut batch = vec![second];
+        let n = rewriter.process_batch(&mut batch);
+        assert_eq!(n, 1, "non-first fragment should be GRE-encapsulated");
+        assert_eq!(
+            rewriter.metrics.fragment_subsequent_forwarded_total.get(),
+            1
+        );
+        assert_eq!(rewriter.metrics.fragment_drop_no_mapping_total.get(), 0);
+    }
+
+    #[test]
+    fn non_first_fragment_without_mapping_is_dropped() {
+        let mut rewriter = setup_rewriter();
+        // No first fragment ever seen — this should hit the drop path.
+        let orphan = build_subsequent_fragment([10, 0, 0, 99], [188, 184, 100, 10], 0xBEEF);
+        let mut batch = vec![orphan];
+        let n = rewriter.process_batch(&mut batch);
+        assert_eq!(n, 0, "orphan fragment must be dropped");
+        assert_eq!(rewriter.metrics.fragment_drop_no_mapping_total.get(), 1);
+        assert_eq!(
+            rewriter.metrics.fragment_subsequent_forwarded_total.get(),
+            0
+        );
+    }
+
+    #[test]
+    fn fragments_of_same_flow_hit_same_backend() {
+        let mut rewriter = setup_rewriter();
+
+        // Prime the fragment table.
+        let first = build_first_fragment([10, 0, 0, 77], [188, 184, 100, 10], 40000, 443, 0x1234);
+        let mut batch = vec![first];
+        rewriter.process_batch(&mut batch);
+        let first_dst = extract_gre_dst(&batch[0]);
+
+        // Subsequent fragments must hit the same dst.
+        let frag = build_subsequent_fragment([10, 0, 0, 77], [188, 184, 100, 10], 0x1234);
+        let mut batch = vec![frag];
+        rewriter.process_batch(&mut batch);
+        let frag_dst = extract_gre_dst(&batch[0]);
+        assert_eq!(first_dst, frag_dst);
+    }
+
+    /// Outer IPv4 dst of a GRE-encapsulated packet is at bytes 16..20.
+    fn extract_gre_dst(pkt: &PacketBuf) -> [u8; 4] {
+        let s = pkt.as_slice();
+        [s[16], s[17], s[18], s[19]]
     }
 
     #[test]
@@ -704,6 +880,8 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
             64,
             ConnTtls::with_established(Duration::from_secs(60)),
+            64,
+            Duration::from_secs(10),
             tables,
             Arc::new(ArcSwap::from_pointee(vip_matcher)),
             Arc::new(DashMap::new()),
