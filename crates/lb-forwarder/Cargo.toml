@@ -9,6 +9,7 @@ lb-types = { workspace = true }
 lb-hashing = { workspace = true }
 lb-io = { workspace = true }
 lb-metrics = { workspace = true }
+lb-tracer = { workspace = true }
 arc-swap = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }

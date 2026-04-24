@@ -934,6 +934,7 @@ dependencies = [
  "lb-hashing",
  "lb-io",
  "lb-metrics",
+ "lb-tracer",
  "lb-types",
  "parking_lot",
  "prometheus-client",
@@ -1028,6 +1029,8 @@ version = "0.1.0"
 dependencies = [
  "lb-io",
  "lb-types",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 
