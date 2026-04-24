@@ -9,9 +9,10 @@ use lb_forwarder::threading::{ForwarderSharedState, MultiThreadedForwarder};
 use lb_forwarder::vip_matcher::VipMatcher;
 use lb_forwarder::ForwarderConfig;
 use lb_hashing::LookupTable;
+use lb_io::af_xdp::{AfXdpConfig, AfXdpIo};
 use lb_io::mock::mock_io;
 use lb_metrics::{LbMetrics, PeerLabels, PeerNotificationLabels};
-use lb_types::{BackendPoolId, HealthStatus, NodeConfig};
+use lb_types::{BackendPoolId, HealthStatus, IoBackend, NodeConfig};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -252,30 +253,54 @@ fn main() {
         icmp_rate_limit: config.forwarder.icmp_rate_limit,
     };
 
-    // Start multi-threaded forwarder
-    // In production, replace mock_io with AfXdpIo or DpdkIo per NIC config.
-    let (rx_io, _rx_handle) = mock_io();
-    let (tx_io, _tx_handle) = mock_io();
-
+    // Start the multi-threaded forwarder against the configured I/O backend.
+    // Each backend arm constructs RX and TX handles and then dispatches to
+    // the same shared-state shape, which is why `MultiThreadedForwarder` is
+    // generic over `T: PacketIo`.
     let num_rewriters = config.node.num_threads;
-
     tracing::info!(
         num_rewriters = num_rewriters,
+        io_backend = ?config.node.io_backend,
         "starting multi-threaded forwarder"
     );
-
-    let forwarder = MultiThreadedForwarder::start(
-        rx_io,
-        tx_io,
-        fwd_config,
-        num_rewriters,
-        ForwarderSharedState {
-            lookup_tables,
-            vip_matcher: vip_matcher.clone(),
-            health_status: health_status.clone(),
-            metrics: metrics.forwarder.clone(),
-        },
-    );
+    let shared = ForwarderSharedState {
+        lookup_tables,
+        vip_matcher: vip_matcher.clone(),
+        health_status: health_status.clone(),
+        metrics: metrics.forwarder.clone(),
+    };
+    let forwarder = match config.node.io_backend {
+        IoBackend::Mock => {
+            let (rx_io, _rx_handle) = mock_io();
+            let (tx_io, _tx_handle) = mock_io();
+            MultiThreadedForwarder::start(rx_io, tx_io, fwd_config, num_rewriters, shared)
+        }
+        IoBackend::AfXdp => {
+            let xdp_cfg = AfXdpConfig {
+                iface: config.node.data_iface.clone(),
+                ..AfXdpConfig::default()
+            };
+            // Fail fast with a clear message — the scaffold returns
+            // `Unsupported` today, so exiting here is the honest response.
+            // When a real implementation lands the same code path will
+            // succeed without further changes.
+            let rx_io = AfXdpIo::new(&xdp_cfg).unwrap_or_else(|e| {
+                eprintln!(
+                    "failed to initialize AF_XDP RX socket on {:?}: {e}",
+                    xdp_cfg.iface
+                );
+                std::process::exit(1);
+            });
+            let tx_io = AfXdpIo::new(&xdp_cfg).unwrap_or_else(|e| {
+                eprintln!(
+                    "failed to initialize AF_XDP TX socket on {:?}: {e}",
+                    xdp_cfg.iface
+                );
+                std::process::exit(1);
+            });
+            MultiThreadedForwarder::start(rx_io, tx_io, fwd_config, num_rewriters, shared)
+        }
+    };
     let forwarder = Arc::new(forwarder);
 
     // Spawn the operations HTTP server (`/healthz`, `/readyz`, `/metrics`).
