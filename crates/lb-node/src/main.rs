@@ -2,6 +2,7 @@ mod ops_server;
 
 use clap::Parser;
 use lb_bgp::{BgpAnnouncer, BgpEvent, BgpSpeaker};
+use lb_config_manager::applier::LookupTables;
 use lb_config_manager::loader::LbConfig;
 use lb_config_manager::watcher::ConfigWatcher;
 use lb_controller::Controller;
@@ -133,11 +134,13 @@ fn main() {
         None
     };
 
-    // Build initial lookup tables from LB config
-    let mut lookup_tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>> = HashMap::new();
+    // Shared lookup-table map. Wrapped in `Arc<ArcSwap<HashMap<…>>>` so the
+    // controller can add or remove pools at runtime atomically — the
+    // forwarder reads this once per batch.
+    let lookup_tables: LookupTables = Arc::new(ArcSwap::from_pointee(HashMap::new()));
 
     if let Some((_, ref lb_config)) = initial_lb_config {
-        apply_lb_config(lb_config, &mut lookup_tables, &vip_matcher);
+        apply_lb_config(lb_config, &lookup_tables, &vip_matcher);
     }
 
     // BGP speaker — one session per configured peer. Spawned on a dedicated
@@ -160,7 +163,7 @@ fn main() {
 
     // Controller
     let mut controller = Controller::new(
-        lookup_tables.clone(),
+        Arc::clone(&lookup_tables),
         health_status.clone(),
         lb_hashing::DEFAULT_TABLE_SIZE,
     );
@@ -268,12 +271,12 @@ fn main() {
         io_backend = ?config.node.io_backend,
         "starting multi-threaded forwarder"
     );
-    // Clone the lookup-table map before handing it to the forwarder: the
-    // ops HTTP server's `/v1/trace` endpoint also needs read access, and
-    // the forwarder consumes its copy.
-    let lookup_tables_for_ops = Arc::new(lookup_tables.clone());
+    // Both the forwarder and the ops HTTP server's `/v1/trace` endpoint need
+    // read access to the shared lookup-table map; cloning the outer `Arc` is
+    // cheap and gives each consumer its own handle to the same `ArcSwap`.
+    let lookup_tables_for_ops = Arc::clone(&lookup_tables);
     let shared = ForwarderSharedState {
-        lookup_tables,
+        lookup_tables: Arc::clone(&lookup_tables),
         vip_matcher: vip_matcher.clone(),
         health_status: health_status.clone(),
         metrics: metrics.forwarder.clone(),
@@ -325,7 +328,7 @@ fn main() {
             },
             node_id: Arc::from(config.node.id.as_str()),
             vip_matcher: Arc::clone(&vip_matcher),
-            lookup_tables: Arc::clone(&lookup_tables_for_ops),
+            lookup_tables: lookup_tables_for_ops,
             health_status: Arc::clone(&health_status),
         };
         let ops_addr = config.node.metrics_addr;
@@ -354,13 +357,10 @@ fn main() {
     // new `LbConfig` over an `mpsc::channel` to an apply-task on the BGP
     // runtime. The apply-task rebuilds the VIP matcher *and* calls
     // `Controller::apply_config`, which rebuilds lookup tables and diffs BGP
-    // announcements. Previously only the VIP matcher was rebuilt — lookup
-    // tables stayed stale and BGP announces didn't track config changes.
-    //
-    // Known limitation: `apply_tables` only updates *existing* pool IDs in the
-    // shared HashMap. Adding a brand-new pool at runtime still requires a
-    // restart; membership changes within existing pools and VIP->pool
-    // remapping both work.
+    // announcements. The shared lookup-table map is `Arc<ArcSwap<HashMap>>`
+    // (see `LookupTables`), so adding *or removing* a pool at runtime
+    // reaches the data plane atomically — the forwarder loads the snapshot
+    // once per batch.
     if let Some((watcher, _)) = initial_lb_config {
         let (config_tx, mut config_rx) = tokio::sync::mpsc::unbounded_channel::<LbConfig>();
 
@@ -484,22 +484,30 @@ fn build_vip_matcher(config: &LbConfig) -> VipMatcher {
     VipMatcher::from_entries(entries)
 }
 
-/// Apply an LB config: build lookup tables and update VIP matcher.
+/// Apply an LB config to the shared state used at boot:
+///
+/// * Build a lookup table per pool and atomically replace the shared map.
+/// * Build the VIP matcher and atomically swap it in.
+///
+/// At runtime this same job is done by `Controller::apply_config`, which
+/// also reconciles BGP announcements; this function is only used for the
+/// pre-controller boot path so the forwarder can come up with a valid
+/// initial state.
 fn apply_lb_config(
     config: &LbConfig,
-    lookup_tables: &mut HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
+    lookup_tables: &LookupTables,
     vip_matcher: &Arc<ArcSwap<VipMatcher>>,
 ) {
-    // Build lookup tables for each pool
+    let mut new_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
     for pool in &config.pools {
         if !pool.backends.is_empty() {
             if let Ok(table) = LookupTable::build(&pool.backends, lb_hashing::DEFAULT_TABLE_SIZE) {
-                lookup_tables.insert(pool.id.clone(), Arc::new(ArcSwap::from_pointee(table)));
+                new_map.insert(pool.id.clone(), Arc::new(table));
             }
         }
     }
+    lookup_tables.store(Arc::new(new_map));
 
-    // Build and swap VIP matcher
     let new_matcher = build_vip_matcher(config);
     vip_matcher.store(Arc::new(new_matcher));
 }

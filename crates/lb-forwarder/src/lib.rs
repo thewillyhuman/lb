@@ -10,11 +10,10 @@ pub mod threading;
 pub mod tracer;
 pub mod vip_matcher;
 
-use lb_hashing::LookupTable;
+use lb_config_manager::applier::LookupTables;
 use lb_io::{PacketBuf, PacketIo};
 use lb_metrics::ForwarderMetrics;
-use lb_types::{BackendPoolId, ConnTtls, HealthStatus, MtuConfig};
-use std::collections::HashMap;
+use lb_types::{ConnTtls, HealthStatus, MtuConfig};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -66,7 +65,7 @@ impl<T: PacketIo> ForwarderEngine<T> {
     pub fn new(
         io: T,
         config: ForwarderConfig,
-        lookup_tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
+        lookup_tables: LookupTables,
         vip_matcher: Arc<ArcSwap<VipMatcher>>,
         health_status: Arc<DashMap<IpAddr, HealthStatus>>,
         metrics: ForwarderMetrics,
@@ -126,7 +125,8 @@ mod tests {
     use super::*;
     use lb_hashing::LookupTable;
     use lb_io::mock::mock_io;
-    use lb_types::{Backend, Protocol};
+    use lb_types::{Backend, BackendPoolId, Protocol};
+    use std::collections::HashMap;
     use std::net::Ipv4Addr;
 
     fn build_tcp_packet(src: [u8; 4], dst: [u8; 4], src_port: u16, dst_port: u16) -> Vec<u8> {
@@ -154,11 +154,9 @@ mod tests {
         let lookup_table = LookupTable::build(&backends, 17).unwrap();
         let pool_id = BackendPoolId("web".into());
 
-        let mut tables = HashMap::new();
-        tables.insert(
-            pool_id.clone(),
-            Arc::new(ArcSwap::from_pointee(lookup_table)),
-        );
+        let mut tables_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
+        tables_map.insert(pool_id.clone(), Arc::new(lookup_table));
+        let tables: LookupTables = Arc::new(ArcSwap::from_pointee(tables_map));
 
         let vip_matcher = vip_matcher::VipMatcher::from_entries(vec![(
             IpAddr::V4(Ipv4Addr::new(188, 184, 100, 10)),
