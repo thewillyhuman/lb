@@ -9,7 +9,9 @@ use crate::validator;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -58,38 +60,46 @@ impl ConfigWatcher {
         ))
     }
 
-    /// Block until the config file changes. Returns the new validated config.
-    /// Malformed files are logged and skipped (blocks again).
-    pub fn wait_for_change(&self) -> LbConfig {
-        loop {
-            match self.rx.recv() {
+    /// Block until the config file changes or `shutdown` is signalled.
+    ///
+    /// Returns `Some(config)` on a successful reload, `None` on either:
+    ///
+    ///   * the inotify channel disconnecting (watcher dropped — shouldn't
+    ///     happen in normal operation, but if it does we want to surface it
+    ///     instead of `park()`-ing the thread forever and confusing the
+    ///     operator), or
+    ///   * `shutdown.load(Relaxed) == true`, polled every 200ms so a
+    ///     `process::exit` from the signal handler isn't needed to make
+    ///     this thread stop.
+    ///
+    /// Malformed-file reloads are logged and skipped (the loop keeps going).
+    pub fn wait_for_change(&self, shutdown: &AtomicBool) -> Option<LbConfig> {
+        const POLL: Duration = Duration::from_millis(200);
+        while !shutdown.load(Ordering::Relaxed) {
+            match self.rx.recv_timeout(POLL) {
                 Ok(Ok(event)) => {
                     if !is_relevant_event(&event, &self.config_path) {
                         continue;
                     }
-
                     match self.try_reload() {
-                        Ok(config) => return config,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                path = %self.config_path.display(),
-                                "config reload failed, keeping previous config"
-                            );
-                        }
+                        Ok(config) => return Some(config),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            path = %self.config_path.display(),
+                            "config reload failed, keeping previous config"
+                        ),
                     }
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "file watcher error");
-                }
-                Err(_) => {
-                    // Channel closed — watcher dropped. This shouldn't happen in normal operation.
-                    tracing::error!("config watcher channel closed");
-                    // Park the thread to avoid a busy loop.
-                    std::thread::park();
+                Ok(Err(e)) => tracing::warn!(error = %e, "file watcher error"),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    tracing::error!("config watcher channel closed; stopping reload thread");
+                    return None;
                 }
             }
         }
+        // Shutdown requested.
+        None
     }
 
     fn try_reload(&self) -> Result<LbConfig, WatchError> {
@@ -195,15 +205,42 @@ mod tests {
         // wait_for_change blocks until the file is modified.
         // Wrap in a timeout thread to avoid hanging the test suite.
         let (tx, rx) = std::sync::mpsc::channel();
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
         std::thread::spawn(move || {
-            let config = watcher.wait_for_change();
+            let config = watcher.wait_for_change(&shutdown);
             let _ = tx.send(config);
         });
 
         let config = rx
             .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("timed out waiting for config change");
+            .expect("timed out waiting for config change")
+            .expect("watcher returned None despite a real file change");
         assert!(config.vips.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wait_for_change_returns_none_on_shutdown_signal() {
+        let dir = std::env::temp_dir().join("lb-watcher-test-shutdown");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        write_valid_config(&path);
+
+        let (watcher, _) = ConfigWatcher::new(&path).unwrap();
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+
+        let shutdown_for_thread = std::sync::Arc::clone(&shutdown);
+        let join = std::thread::spawn(move || watcher.wait_for_change(&shutdown_for_thread));
+
+        // Flip the shutdown after a moment; the watcher polls every 200ms
+        // so the worst case is ~200ms before the loop notices.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        shutdown.store(true, Ordering::Relaxed);
+
+        let result = join.join().expect("watcher thread panicked");
+        assert!(result.is_none(), "expected None on shutdown, got {result:?}");
 
         fs::remove_dir_all(&dir).ok();
     }
