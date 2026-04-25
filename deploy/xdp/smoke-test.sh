@@ -77,7 +77,10 @@ ip netns exec "$NS" ip link set "$VETH_NS" up
 sleep 0.5
 
 echo "== Attaching XDP program to $VETH_HOST =="
-"$(dirname "$0")"/load.sh "$VETH_HOST" skb   # veth supports SKB mode
+# `auto` would also work — veth doesn't support native mode, so it'd
+# fall back to skb. Pass `skb` explicitly to make the mode the test
+# exercises obvious in the output.
+"$(dirname "$0")"/load.sh "$VETH_HOST" skb
 
 echo "== Starting lb-node =="
 cat > /tmp/lb-smoke-config.toml <<EOF

@@ -12,7 +12,7 @@ A high-performance L4 packet-forwarding load balancer written in Rust, inspired 
 - **GRE encapsulation** -- RFC 2784 tunneling to backends, supports IPv4/IPv6 inner packets, Direct Server Return (DSR)
 - **MTU-aware tunneling** -- automatic MSS clamping on TCP SYN/SYN-ACK (incremental checksum, RFC 1624), ICMP Fragmentation Needed generation for oversized non-TCP packets with DF set, rate-limited. Operator sets `network_mtu`; all tunnel parameters derived automatically
 - **IP fragment reassembly pinning** -- first fragment flows through the full Maglev pipeline and records its 3-tuple→backend choice in a per-thread Robin Hood table; non-first fragments (which have no L4 header) look up the 3-tuple and GRE-encap to the same backend. Bounded table size + TTL so a fragment flood can't grow memory unbounded
-- **Kernel bypass I/O** -- AF_XDP and DPDK backends for line-rate packet processing on commodity hardware
+- **Kernel bypass I/O** -- AF_XDP backend for line-rate packet processing on commodity hardware. Auto-fallback from native to generic/SKB XDP mode means it runs on any x86_64 / ARM64 Linux server with kernel ≥ 5.10, no SmartNIC or DPDK toolchain required (see [ADR-002](.docs/adr-002-af-xdp-implementation-strategy.md))
 - **Multi-threaded data plane** -- steering thread distributes to per-rewriter SPSC queues; muxer thread collects TX output. Zero-copy hot path: packets live in a shared `PacketPool` arena, only 4-byte frame indices flow through queues (AF_XDP UMEM model)
 - **Health checking** -- TCP, HTTP, and HTTPS probes with configurable thresholds and state machine (UNKNOWN/HEALTHY/UNHEALTHY)
 - **BGP speaker** -- minimal custom implementation (OPEN/UPDATE/KEEPALIVE/NOTIFICATION) with active-active announcement to multiple router peers. Each peer holds an independent session with exponential-backoff reconnect (1s→60s); VIPs fan out to every Established peer so loss of any single router does not withdraw the VIP from the others. Driven by the controller: a VIP is announced while at least one backend in its pool is healthy and withdrawn otherwise
@@ -220,6 +220,7 @@ cargo build --release
 - **[Design specification](.docs/lb-spec-v2.md)** -- full architecture and protocol details
 - **[MTU handling spec](.docs/mtu-handling-spec.md)** -- MSS clamping, ICMP Frag Needed, MTU configuration
 - **[ADR-001: Configuration model](.docs/adr-001-configuration-model.md)** -- rationale for file-based configuration
+- **[ADR-002: AF_XDP implementation strategy](.docs/adr-002-af-xdp-implementation-strategy.md)** -- xdpilone, frame-pool design, **commodity-hardware constraint** (no SmartNICs / DPDK / kernel patches required)
 
 ## Project structure
 

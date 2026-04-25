@@ -370,15 +370,25 @@ sudo apt install clang libbpf-dev bpftool
 # Build the redirect program (deploy/xdp/redirect.bpf.o is gitignored)
 make -C deploy/xdp
 
-# Attach to the data interface in native XDP mode
-sudo deploy/xdp/load.sh eth0 native
+# Attach to the data interface. Default mode is `auto`: try native
+# (driver-attached, fastest), fall back to skb (generic kernel hook,
+# works on every NIC since 5.10). Pass `native` or `skb` explicitly
+# to force a mode.
+sudo deploy/xdp/load.sh eth0
 ```
 
 The script attaches the program, pins the XSKMAP at
-`/sys/fs/bpf/lb/xsks_map`, and prints next steps. `lb-node` opens the
-pinned map at startup and inserts its own XSK fd at index `queue_id`
-(per `[node].cpu_affinity.rewriters`); no manual `bpftool map update`
-is needed.
+`/sys/fs/bpf/lb/xsks_map`, and prints which mode it ended up using.
+`lb-node` opens the pinned map at startup and inserts its own XSK fd
+at index `queue_id` (per `[node].cpu_affinity.rewriters`); no manual
+`bpftool map update` is needed.
+
+The commodity-hardware path is **skb mode**: it works on any Linux
+kernel ≥ 5.10 regardless of NIC vendor or driver vintage, at the
+cost of ~30–40% throughput compared to native. Native mode is
+preferred when available (Intel ixgbe/i40e/ice, Mellanox CX-4+, AWS
+ENA, virtio-net 5.13+, Broadcom bnxt 5.9+); the auto path picks it
+when the driver supports it and silently falls back when not.
 
 To detach (e.g. before swapping to a different program):
 
