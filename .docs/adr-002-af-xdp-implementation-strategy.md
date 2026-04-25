@@ -36,6 +36,31 @@ the implementation approach for the remaining work.
 5. **Portability**: ARM64 must remain a first-class target alongside
    x86_64 — the release workflow ships both. Anything pinned to Intel
    intrinsics or x86-only XDP features is out.
+6. **Commodity hardware** (load-bearing for the rest of the project,
+   not just AF_XDP): `lb-node` must run on any x86_64 or ARM64 Linux
+   server with a stock kernel ≥ 5.10 and a stock NIC driver. No
+   SmartNIC requirement, no specific vendor, no kernel patches, no
+   custom firmware. This rules out:
+   * **HW-mode XDP offload** (`XDP_FLAGS_HW_MODE`): only Netronome /
+     Corigine and a few others. Out — implementation can opt in
+     manually if a deployment happens to have the right NIC, but the
+     default path must not assume it.
+   * **Driver-private fast paths** (e.g. Mellanox-only `XDP_FLAGS_DRV_MODE`
+     extensions): out — anything that needs `ETHTOOL_GFEATURES` flags
+     not present on every commodity NIC.
+   * **Userspace-driver bypass** (DPDK): explicitly rejected in
+     ADR-pre-existing context; needs huge pages, IOMMU bind, vendor
+     PMDs.
+
+   What this *does* mean operationally: AF_XDP runs in **native mode**
+   on drivers that support it (Intel ixgbe/i40e/ice, Mellanox CX-4+,
+   AWS ENA, virtio-net 5.13+, Broadcom bnxt 5.9+, ...) and falls back
+   to **generic / SKB mode** on everything else. SKB mode loses ~30–40%
+   of throughput but works on any Linux NIC since it runs in the
+   kernel's generic XDP hook instead of the driver. `deploy/xdp/load.sh`
+   defaults to `auto` mode (try native, fall back to skb), so an
+   operator running on hardware that doesn't support native XDP gets
+   a working deployment without having to know which mode to pick.
 
 ## Options considered
 
