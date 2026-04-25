@@ -87,8 +87,12 @@ bytes = "1"
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
-# AF_XDP (Linux kernel bypass)
-libbpf-sys = "1"
+# AF_XDP (Linux kernel bypass). `xdpilone` is the Rust-native XSK-ring
+# wrapper chosen in ADR-002 — it does *not* depend on libbpf/libxdp at
+# runtime, which keeps the build dependency footprint to "kernel headers
+# present at compile time" only. `libc` is for the few socket/syscall
+# bits xdpilone doesn't expose itself.
+xdpilone = "1.2"
 libc = "0.2"
 
 # TLS
