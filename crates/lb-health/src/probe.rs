@@ -148,6 +148,67 @@ impl HttpsProbe {
             connector: TlsConnector::from(Arc::new(tls_config)),
         }
     }
+
+    /// Build a probe with mutual TLS: server is validated against
+    /// `server_roots` (PEM-formatted bundle), and the client presents its
+    /// own certificate chain + private key during the handshake. Backends
+    /// can therefore demand `verify-client-cert` and reject probes coming
+    /// from anything but the LB.
+    ///
+    /// Inputs:
+    ///   * `server_roots_pem` — PEM bundle the probe trusts as server CAs.
+    ///     Pass an empty bundle to mean "use the system trust store
+    ///     (webpki-roots)" — callers usually want a private CA here, not
+    ///     public roots, so the empty case is rare.
+    ///   * `client_cert_pem` — PEM-encoded client cert chain (leaf first).
+    ///   * `client_key_pem` — PEM-encoded private key (PKCS#8 or PKCS#1).
+    ///
+    /// Errors are returned as `String` so callers (typically the
+    /// config-loader path) can surface them at startup rather than at
+    /// the first probe — the trust store doesn't change between probes.
+    pub fn with_mtls(
+        path: impl Into<String>,
+        server_roots_pem: &[u8],
+        client_cert_pem: &[u8],
+        client_key_pem: &[u8],
+    ) -> Result<Self, String> {
+        let mut root_store = rustls::RootCertStore::empty();
+        if server_roots_pem.is_empty() {
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        } else {
+            for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(server_roots_pem)) {
+                let cert = cert.map_err(|e| format!("invalid server CA PEM: {e}"))?;
+                root_store
+                    .add(cert)
+                    .map_err(|e| format!("server CA rejected: {e}"))?;
+            }
+            if root_store.is_empty() {
+                return Err("server_roots_pem contained no certificates".into());
+            }
+        }
+
+        let client_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut std::io::BufReader::new(client_cert_pem))
+                .collect::<Result<_, _>>()
+                .map_err(|e| format!("invalid client cert PEM: {e}"))?;
+        if client_certs.is_empty() {
+            return Err("client_cert_pem contained no certificates".into());
+        }
+
+        let client_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(client_key_pem))
+            .map_err(|e| format!("invalid client key PEM: {e}"))?
+            .ok_or_else(|| "client_key_pem contained no private key".to_string())?;
+
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_client_auth_cert(client_certs, client_key)
+            .map_err(|e| format!("client auth setup failed: {e}"))?;
+
+        Ok(Self {
+            path: path.into(),
+            connector: TlsConnector::from(Arc::new(tls_config)),
+        })
+    }
 }
 
 impl Probe for HttpsProbe {
@@ -354,5 +415,97 @@ mod tests {
             .check(&backend(19997), Duration::from_millis(100))
             .await;
         assert!(!result.is_success());
+    }
+
+    #[tokio::test]
+    async fn https_probe_mtls_success() {
+        // Server CA, server cert, client CA, client cert.
+        // For brevity we use one CA (rcgen's default-self-signed) for both
+        // server and client auth — production would use separate CAs.
+        let server_cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let client_cert = rcgen::generate_simple_self_signed(vec!["lb-node".into()]).unwrap();
+
+        let server_cert_der =
+            rustls::pki_types::CertificateDer::from(server_cert.cert.der().to_vec());
+        let server_key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(server_cert.key_pair.serialize_der())
+                .unwrap();
+
+        // Server requires a client cert signed by client_cert (acting as its
+        // own CA — fine for a self-signed test) — meaning only probes using
+        // the matching client cert can complete the handshake.
+        let mut client_root_store = rustls::RootCertStore::empty();
+        let client_ca_der =
+            rustls::pki_types::CertificateDer::from(client_cert.cert.der().to_vec());
+        client_root_store.add(client_ca_der.clone()).unwrap();
+        let client_verifier =
+            rustls::server::WebPkiClientVerifier::builder(Arc::new(client_root_store))
+                .build()
+                .unwrap();
+
+        let server_tls = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(vec![server_cert_der.clone()], server_key_der)
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls));
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let mut tls_stream = match acceptor.accept(stream).await {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    let mut buf = [0u8; 1024];
+                    let _ = tls_stream.read(&mut buf).await;
+                    let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                    let _ = tls_stream.write_all(response.as_bytes()).await;
+                    let _ = tls_stream.shutdown().await;
+                });
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Probe trusts the server CA (= server's self-signed cert) and
+        // presents the client cert + key.
+        let server_pem = server_cert.cert.pem();
+        let client_pem = client_cert.cert.pem();
+        let client_key_pem = client_cert.key_pair.serialize_pem();
+        let probe = HttpsProbe::with_mtls(
+            "/healthz",
+            server_pem.as_bytes(),
+            client_pem.as_bytes(),
+            client_key_pem.as_bytes(),
+        )
+        .expect("mTLS probe construction");
+
+        let result = probe.check(&backend(port), Duration::from_secs(2)).await;
+        assert!(result.is_success(), "expected success, got {result:?}");
+    }
+
+    #[test]
+    fn https_probe_mtls_rejects_empty_client_cert() {
+        let err = match HttpsProbe::with_mtls("/h", b"", b"", b"") {
+            Err(e) => e,
+            Ok(_) => panic!("expected with_mtls to error on empty PEM"),
+        };
+        assert!(err.contains("client_cert_pem"), "got: {err}");
+    }
+
+    #[test]
+    fn https_probe_mtls_rejects_invalid_pem() {
+        let err = match HttpsProbe::with_mtls("/h", b"", b"not a cert", b"not a key") {
+            Err(e) => e,
+            Ok(_) => panic!("expected with_mtls to error on garbage PEM"),
+        };
+        // Either "invalid client cert PEM" or "no certificates" — the
+        // important thing is we surface it instead of crashing later.
+        assert!(
+            err.contains("client_cert") || err.contains("no certificates"),
+            "got: {err}"
+        );
     }
 }
