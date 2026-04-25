@@ -36,7 +36,26 @@ pub struct ForwarderConfig {
     pub icmp_rate_limit: u32,
 }
 
-/// Single-threaded forwarder engine (multi-threading added in Iteration 6).
+/// Single-threaded forwarder engine.
+///
+/// **Not for production.** `lb-node` uses [`threading::MultiThreadedForwarder`]
+/// — that's the steering + rewriter + muxer pipeline with the zero-copy
+/// `PacketPool` that benchmarks at ~400 ns/packet end-to-end.
+/// `ForwarderEngine` exists only as the test/dev-mode driver:
+///
+///   * Drives one rewriter on the calling thread, no inter-thread queues.
+///   * `process_one` calls `PacketBuf::clone()` twice per packet (once at
+///     batch entry, once before MSS clamp) because the engine doesn't have
+///     a `PacketPool` to mutate frames in place. This is fine for tests
+///     where you process a few packets per iteration; it's not what you
+///     want at line rate.
+///   * Used by the `end_to_end_with_mock_io` integration test in this
+///     module and by some benches that want a tighter measurement loop
+///     than the multi-threaded pipeline can give them.
+///
+/// Hidden from user-facing rustdoc to keep the public surface honest;
+/// still `pub` because tests across crates use it.
+#[doc(hidden)]
 pub struct ForwarderEngine<T: PacketIo> {
     io: T,
     rewriter: RewriterThread,
