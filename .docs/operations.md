@@ -357,6 +357,38 @@ Releases are cut by pushing a `v*` tag to the repo; see
 aarch64 tarballs containing `lb-node` + `lb-trace` + the unit file, plus
 a multi-arch container image).
 
+### Loading the XDP redirect program (AF_XDP only)
+
+`lb-node` on the `af_xdp` backend depends on a kernel-side XDP program
+that redirects packets into the userspace XSK ring. Build and attach it
+once per host before starting `lb-node`:
+
+```bash
+# One-time per host — installs clang + libbpf headers
+sudo apt install clang libbpf-dev bpftool
+
+# Build the redirect program (deploy/xdp/redirect.bpf.o is gitignored)
+make -C deploy/xdp
+
+# Attach to the data interface in native XDP mode
+sudo deploy/xdp/load.sh eth0 native
+```
+
+The script attaches the program, pins the XSKMAP at
+`/sys/fs/bpf/lb/xsks_map`, and prints next steps. `lb-node` opens the
+pinned map at startup and inserts its own XSK fd at index `queue_id`
+(per `[node].cpu_affinity.rewriters`); no manual `bpftool map update`
+is needed.
+
+To detach (e.g. before swapping to a different program):
+
+```bash
+sudo deploy/xdp/unload.sh eth0
+```
+
+`mock` backend deployments don't need any of this — skip straight to
+the systemd setup below.
+
 ### Systemd
 
 A ready-to-use unit file is at `deploy/lb-node.service`. The service runs as a dedicated unprivileged `lb-node` user with capabilities granted explicitly — create the user first, then install the unit:
