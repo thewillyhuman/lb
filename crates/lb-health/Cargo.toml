@@ -13,6 +13,7 @@ dashmap = { workspace = true }
 thiserror = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
+rustls-pemfile = "2"
 webpki-roots = { workspace = true }
 
 [dev-dependencies]

@@ -1078,6 +1078,7 @@ dependencies = [
  "lb-types",
  "rcgen",
  "rustls",
+ "rustls-pemfile",
  "thiserror",
  "tokio",
  "tokio-rustls",
