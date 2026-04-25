@@ -479,7 +479,7 @@ Deploy LB nodes behind an ECMP router. The router distributes traffic evenly acr
 ### Backend not receiving traffic
 
 - Check health status -- an unhealthy backend is excluded from the lookup table.
-- Check that the backend can decapsulate GRE (IP protocol 47) and that its loopback interface has the VIP address configured for DSR.
+- Check that the backend can decapsulate GRE (IP protocol 47) and that its loopback interface has the VIP address configured for DSR. Run `sudo deploy/validate-backend.sh <vip> <iface>` *on the backend host* — it checks VIP loopback binding, `rp_filter`, GRE tunnel device, ARP suppression, and routing in one shot, prints PASS/WARN/FAIL with the matching remediation command, and exits non-zero if DSR will not work.
 - Verify GRE connectivity: `ping -I <lb-node-ip> <backend-ip>`.
 - Ask the node which backend it *thinks* a given 5-tuple maps to, without injecting anything:
 
