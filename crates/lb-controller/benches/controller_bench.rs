@@ -7,6 +7,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 
+use lb_config_manager::applier::LookupTables;
 use lb_config_manager::loader::LbConfig;
 use lb_controller::Controller;
 use lb_hashing::LookupTable;
@@ -117,20 +118,15 @@ fn make_correlated_config(
     (LbConfig { vips, pools }, failing_ips)
 }
 
-fn setup_controller(
-    config: &LbConfig,
-    table_size: usize,
-) -> (
-    Controller,
-    HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
-) {
-    let mut tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>> = HashMap::new();
+fn setup_controller(config: &LbConfig, table_size: usize) -> (Controller, LookupTables) {
+    let mut tables_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
     for pool in &config.pools {
         let table = LookupTable::build(&pool.backends, table_size).unwrap();
-        tables.insert(pool.id.clone(), Arc::new(ArcSwap::from_pointee(table)));
+        tables_map.insert(pool.id.clone(), Arc::new(table));
     }
+    let tables: LookupTables = Arc::new(ArcSwap::from_pointee(tables_map));
     let health_status = Arc::new(DashMap::new());
-    let mut controller = Controller::new(tables.clone(), health_status, table_size);
+    let mut controller = Controller::new(Arc::clone(&tables), health_status, table_size);
     controller.apply_config(config.clone());
     (controller, tables)
 }

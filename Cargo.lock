@@ -1045,6 +1045,7 @@ dependencies = [
  "criterion",
  "crossbeam",
  "dashmap",
+ "lb-config-manager",
  "lb-hashing",
  "lb-io",
  "lb-metrics",

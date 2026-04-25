@@ -79,16 +79,32 @@ pub fn build_backend_pool_index(config: &LbConfig) -> HashMap<IpAddr, HashSet<Ba
     index
 }
 
-/// Atomically swap lookup tables into the shared state.
-pub fn apply_tables(
-    new_tables: HashMap<BackendPoolId, Arc<LookupTable>>,
-    shared_tables: &HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
-) {
-    for (pool_id, new_table) in new_tables {
-        if let Some(swap) = shared_tables.get(&pool_id) {
-            swap.store(new_table);
-        }
-    }
+/// Type alias for the shared map of pool id → lookup table.
+///
+/// Wrapped in `Arc<ArcSwap<HashMap<…>>>` (rather than the older shape of
+/// `HashMap<…, Arc<ArcSwap<…>>>`) so the controller can add and remove
+/// pool entries at runtime atomically. The forwarder reads via
+/// `lookup_tables.load()` once per batch.
+pub type LookupTables = Arc<ArcSwap<HashMap<BackendPoolId, Arc<LookupTable>>>>;
+
+/// Merge `updates` into the shared lookup-table map. Any existing pool not
+/// mentioned in `updates` is preserved — this is the path used by health-
+/// driven rebuilds where we only have entries for the affected pools.
+/// Use [`replace_tables`] when applying a fresh full config.
+pub fn apply_tables(updates: HashMap<BackendPoolId, Arc<LookupTable>>, shared: &LookupTables) {
+    let current = shared.load_full();
+    let mut next: HashMap<BackendPoolId, Arc<LookupTable>> = (*current).clone();
+    next.extend(updates);
+    shared.store(Arc::new(next));
+}
+
+/// Atomically replace the entire lookup-table map. Used on full
+/// `apply_config` calls where the operator's intent is "every pool now
+/// looks like this and removed pools should disappear". Pools present in
+/// the previous state but missing from `new_tables` are dropped, freeing
+/// their `Arc<LookupTable>` once outstanding readers finish.
+pub fn replace_tables(new_tables: HashMap<BackendPoolId, Arc<LookupTable>>, shared: &LookupTables) {
+    shared.store(Arc::new(new_tables));
 }
 
 #[cfg(test)]
@@ -181,32 +197,103 @@ mod tests {
     }
 
     #[test]
-    fn apply_tables_swaps_atomically() {
+    fn apply_tables_merges_into_shared_map() {
         let config = make_config();
         let health = HashMap::new();
         let tables = build_lookup_tables(&config, &health, 17);
 
-        // Set up shared state
         let pool_id = BackendPoolId("web".into());
-        let initial_table = LookupTable::build(
+        let initial = LookupTable::build(
             &[Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99)), 80)],
             17,
         )
         .unwrap();
-        let mut shared = HashMap::new();
-        shared.insert(
-            pool_id.clone(),
-            Arc::new(ArcSwap::from_pointee(initial_table)),
-        );
+        let mut initial_map: HashMap<_, _> = HashMap::new();
+        initial_map.insert(pool_id.clone(), Arc::new(initial));
+        let shared: LookupTables = Arc::new(ArcSwap::from_pointee(initial_map));
 
-        // Verify initial state
-        assert_eq!(shared[&pool_id].load().num_backends(), 1);
+        assert_eq!(shared.load()[&pool_id].num_backends(), 1);
 
-        // Apply new tables
         apply_tables(tables, &shared);
 
-        // Verify swapped
-        assert_eq!(shared[&pool_id].load().num_backends(), 3);
+        assert_eq!(shared.load()[&pool_id].num_backends(), 3);
+    }
+
+    #[test]
+    fn apply_tables_inserts_new_pool_at_runtime() {
+        // Closes the "adding a new pool requires a restart" gap from the
+        // production-readiness audit. The shared map starts with `web`;
+        // a config reload that introduces `api` must reach the data plane.
+        let initial = LookupTable::build(
+            &[Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443)],
+            17,
+        )
+        .unwrap();
+        let mut initial_map: HashMap<_, _> = HashMap::new();
+        initial_map.insert(BackendPoolId("web".into()), Arc::new(initial));
+        let shared: LookupTables = Arc::new(ArcSwap::from_pointee(initial_map));
+
+        let new_pool = LookupTable::build(
+            &[Backend::new(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1)), 8080)],
+            17,
+        )
+        .unwrap();
+        let mut updates = HashMap::new();
+        updates.insert(BackendPoolId("api".into()), Arc::new(new_pool));
+
+        apply_tables(updates, &shared);
+
+        let snap = shared.load();
+        assert!(snap.contains_key(&BackendPoolId("web".into())));
+        assert!(snap.contains_key(&BackendPoolId("api".into())));
+    }
+
+    #[test]
+    fn replace_tables_drops_pools_not_in_new_set() {
+        // Full-config-apply path: a pool removed from the JSON should
+        // disappear from the shared map.
+        let mut initial_map: HashMap<_, _> = HashMap::new();
+        initial_map.insert(
+            BackendPoolId("web".into()),
+            Arc::new(
+                LookupTable::build(
+                    &[Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443)],
+                    17,
+                )
+                .unwrap(),
+            ),
+        );
+        initial_map.insert(
+            BackendPoolId("legacy".into()),
+            Arc::new(
+                LookupTable::build(
+                    &[Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 80)],
+                    17,
+                )
+                .unwrap(),
+            ),
+        );
+        let shared: LookupTables = Arc::new(ArcSwap::from_pointee(initial_map));
+
+        let mut new_state = HashMap::new();
+        new_state.insert(
+            BackendPoolId("web".into()),
+            Arc::new(
+                LookupTable::build(
+                    &[Backend::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443)],
+                    17,
+                )
+                .unwrap(),
+            ),
+        );
+        replace_tables(new_state, &shared);
+
+        let snap = shared.load();
+        assert!(snap.contains_key(&BackendPoolId("web".into())));
+        assert!(
+            !snap.contains_key(&BackendPoolId("legacy".into())),
+            "replace_tables must drop pools no longer in the config"
+        );
     }
 
     #[test]

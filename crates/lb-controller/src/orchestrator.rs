@@ -1,8 +1,7 @@
 use lb_bgp::BgpAnnouncer;
-use lb_config_manager::applier;
+use lb_config_manager::applier::{self, LookupTables};
 use lb_config_manager::cache;
 use lb_config_manager::loader::LbConfig;
-use lb_hashing::LookupTable;
 use lb_types::{BackendPoolId, HealthStatus};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
@@ -10,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
 use dashmap::DashMap;
 
 /// Health change events within this window are batched into a single rebuild
@@ -20,8 +18,11 @@ const DEBOUNCE_WINDOW: Duration = Duration::from_millis(50);
 
 /// The control-plane orchestrator. Coordinates health checking, BGP, and config.
 pub struct Controller {
-    /// Shared lookup tables (controller writes, forwarder reads).
-    lookup_tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
+    /// Shared lookup tables (controller writes, forwarder reads). Wrapped
+    /// as `Arc<ArcSwap<HashMap<…>>>` so adding/removing a pool at runtime
+    /// reaches the data plane atomically — the forwarder loads the map
+    /// once per batch.
+    lookup_tables: LookupTables,
     /// Shared health status (health checker writes, forwarder reads).
     health_status: Arc<DashMap<IpAddr, HealthStatus>>,
     /// Current config.
@@ -51,7 +52,7 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(
-        lookup_tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
+        lookup_tables: LookupTables,
         health_status: Arc<DashMap<IpAddr, HealthStatus>>,
         table_size: usize,
     ) -> Self {
@@ -133,8 +134,10 @@ impl Controller {
         // Build new lookup tables for all pools
         let new_tables = applier::build_lookup_tables(&config, &health, self.table_size);
 
-        // Swap them in
-        applier::apply_tables(new_tables, &self.lookup_tables);
+        // Full-config apply: drop pools that the new config no longer
+        // mentions. Uses replace_tables (not apply_tables) so removed
+        // pools don't linger in the shared map.
+        applier::replace_tables(new_tables, &self.lookup_tables);
 
         // Rebuild the reverse index (backend IP -> pool IDs)
         self.backend_pool_index = applier::build_backend_pool_index(&config);
@@ -341,6 +344,8 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arc_swap::ArcSwap;
+    use lb_hashing::LookupTable;
     use lb_types::*;
     use std::net::Ipv4Addr;
 
@@ -402,19 +407,15 @@ mod tests {
         }
     }
 
-    fn setup_controller(
-        config: &LbConfig,
-    ) -> (
-        Controller,
-        HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
-    ) {
-        let mut tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>> = HashMap::new();
+    fn setup_controller(config: &LbConfig) -> (Controller, LookupTables) {
+        let mut tables_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
         for pool in &config.pools {
             let table = LookupTable::build(&pool.backends, 17).unwrap();
-            tables.insert(pool.id.clone(), Arc::new(ArcSwap::from_pointee(table)));
+            tables_map.insert(pool.id.clone(), Arc::new(table));
         }
+        let tables: LookupTables = Arc::new(ArcSwap::from_pointee(tables_map));
         let health_status = Arc::new(DashMap::new());
-        let mut controller = Controller::new(tables.clone(), health_status, 17);
+        let mut controller = Controller::new(Arc::clone(&tables), health_status, 17);
         controller.apply_config(config.clone());
         (controller, tables)
     }
@@ -428,19 +429,61 @@ mod tests {
         )
         .unwrap();
 
-        let mut tables = HashMap::new();
-        tables.insert(
-            pool_id.clone(),
-            Arc::new(ArcSwap::from_pointee(initial_table)),
-        );
+        let mut tables_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
+        tables_map.insert(pool_id.clone(), Arc::new(initial_table));
+        let tables: LookupTables = Arc::new(ArcSwap::from_pointee(tables_map));
 
         let health_status = Arc::new(DashMap::new());
-        let mut controller = Controller::new(tables.clone(), health_status, 17);
+        let mut controller = Controller::new(Arc::clone(&tables), health_status, 17);
 
         controller.apply_config(make_config());
 
         // Table should now have 2 backends
-        assert_eq!(tables[&pool_id].load().num_backends(), 2);
+        assert_eq!(tables.load()[&pool_id].num_backends(), 2);
+    }
+
+    #[test]
+    fn apply_config_drops_pools_no_longer_in_config() {
+        // Closes the "removed pool stays in shared map" gap.
+        let mut config = make_config();
+        config.pools.push(BackendPool {
+            id: BackendPoolId("legacy-pool".into()),
+            backends: vec![Backend::new(IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9)), 80)],
+            health_check: None,
+        });
+        let (mut controller, tables) = setup_controller(&config);
+        assert!(tables
+            .load()
+            .contains_key(&BackendPoolId("legacy-pool".into())));
+
+        controller.apply_config(make_config()); // legacy-pool removed
+
+        let snap = tables.load();
+        assert!(snap.contains_key(&BackendPoolId("web-pool".into())));
+        assert!(
+            !snap.contains_key(&BackendPoolId("legacy-pool".into())),
+            "legacy-pool should have been dropped from the shared map"
+        );
+    }
+
+    #[test]
+    fn apply_config_inserts_new_pool_at_runtime() {
+        // Closes the audit's "adding a new pool requires a restart" finding.
+        let (mut controller, tables) = setup_controller(&make_config());
+        assert!(!tables.load().contains_key(&BackendPoolId("api".into())));
+
+        let mut extended = make_config();
+        extended.pools.push(BackendPool {
+            id: BackendPoolId("api".into()),
+            backends: vec![Backend::new(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1)), 8080)],
+            health_check: None,
+        });
+        controller.apply_config(extended);
+
+        assert!(
+            tables.load().contains_key(&BackendPoolId("api".into())),
+            "newly added pool should be in the shared map without a restart"
+        );
     }
 
     #[test]
@@ -448,7 +491,7 @@ mod tests {
         let (mut controller, tables) = setup_controller(&make_config());
         let pool_id = BackendPoolId("web-pool".into());
 
-        assert_eq!(tables[&pool_id].load().num_backends(), 2);
+        assert_eq!(tables.load()[&pool_id].num_backends(), 2);
 
         // Mark one backend unhealthy — should NOT rebuild immediately
         controller.on_health_change(
@@ -467,7 +510,7 @@ mod tests {
 
         // But the lookup table hasn't been rebuilt yet (within debounce window)
         assert!(controller.has_pending_rebuilds());
-        assert_eq!(tables[&pool_id].load().num_backends(), 2);
+        assert_eq!(tables.load()[&pool_id].num_backends(), 2);
     }
 
     #[test]
@@ -484,7 +527,7 @@ mod tests {
         controller.flush_pending();
 
         assert!(!controller.has_pending_rebuilds());
-        assert_eq!(tables[&pool_id].load().num_backends(), 1);
+        assert_eq!(tables.load()[&pool_id].num_backends(), 1);
     }
 
     #[test]
@@ -496,9 +539,9 @@ mod tests {
         let pool_b = BackendPoolId("pool-b".into());
         let pool_c = BackendPoolId("pool-c".into());
 
-        assert_eq!(tables[&pool_a].load().num_backends(), 3);
-        assert_eq!(tables[&pool_b].load().num_backends(), 3);
-        assert_eq!(tables[&pool_c].load().num_backends(), 2);
+        assert_eq!(tables.load()[&pool_a].num_backends(), 3);
+        assert_eq!(tables.load()[&pool_b].num_backends(), 3);
+        assert_eq!(tables.load()[&pool_c].num_backends(), 2);
 
         // Simulate a rack switch failure: backends 10.0.0.2 and 10.0.0.3 go
         // down simultaneously. Both appear in pool-a and pool-b.
@@ -512,15 +555,15 @@ mod tests {
         );
 
         // Tables haven't been rebuilt yet (debounce window)
-        assert_eq!(tables[&pool_a].load().num_backends(), 3);
-        assert_eq!(tables[&pool_b].load().num_backends(), 3);
+        assert_eq!(tables.load()[&pool_a].num_backends(), 3);
+        assert_eq!(tables.load()[&pool_b].num_backends(), 3);
 
         // Flush — pool-a and pool-b are rebuilt ONCE each, with both changes applied
         controller.flush_pending();
 
-        assert_eq!(tables[&pool_a].load().num_backends(), 1); // only 10.0.0.1 left
-        assert_eq!(tables[&pool_b].load().num_backends(), 1); // only 10.0.0.4 left
-        assert_eq!(tables[&pool_c].load().num_backends(), 2); // unaffected
+        assert_eq!(tables.load()[&pool_a].num_backends(), 1); // only 10.0.0.1 left
+        assert_eq!(tables.load()[&pool_b].num_backends(), 1); // only 10.0.0.4 left
+        assert_eq!(tables.load()[&pool_c].num_backends(), 2); // unaffected
     }
 
     #[test]
@@ -535,7 +578,7 @@ mod tests {
 
         // tick() right away — still within debounce window, no flush
         controller.tick();
-        assert_eq!(tables[&pool_id].load().num_backends(), 2);
+        assert_eq!(tables.load()[&pool_id].num_backends(), 2);
 
         // Wait for the debounce window to elapse
         std::thread::sleep(DEBOUNCE_WINDOW + Duration::from_millis(10));
@@ -543,7 +586,7 @@ mod tests {
         // Now tick() should flush
         controller.tick();
         assert!(!controller.has_pending_rebuilds());
-        assert_eq!(tables[&pool_id].load().num_backends(), 1);
+        assert_eq!(tables.load()[&pool_id].num_backends(), 1);
     }
 
     #[test]
@@ -575,8 +618,8 @@ mod tests {
 
         // Both changes flushed together — no pending work remains
         assert!(!controller.has_pending_rebuilds());
-        assert_eq!(tables[&pool_a].load().num_backends(), 1); // only 10.0.0.1
-        assert_eq!(tables[&pool_b].load().num_backends(), 1); // only 10.0.0.4
+        assert_eq!(tables.load()[&pool_a].num_backends(), 1); // only 10.0.0.1
+        assert_eq!(tables.load()[&pool_b].num_backends(), 1); // only 10.0.0.4
     }
 
     #[test]
@@ -591,7 +634,7 @@ mod tests {
         );
 
         assert!(!controller.has_pending_rebuilds());
-        assert_eq!(tables[&pool_id].load().num_backends(), 2);
+        assert_eq!(tables.load()[&pool_id].num_backends(), 2);
     }
 
     #[test]
@@ -611,7 +654,7 @@ mod tests {
 
         assert!(!controller.has_pending_rebuilds());
         // apply_config rebuilt with current health, so 10.0.0.2 is excluded
-        assert_eq!(tables[&pool_id].load().num_backends(), 1);
+        assert_eq!(tables.load()[&pool_id].num_backends(), 1);
     }
 
     /// In-memory BGP announcer that records every call. Lets us test the
@@ -699,11 +742,12 @@ mod tests {
 
     fn setup_with_bgp() -> (Controller, Arc<MockAnnouncer>, Ipv4Addr, Ipv4Addr) {
         let (cfg, vip_a, vip_b) = make_bgp_config();
-        let mut tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>> = HashMap::new();
+        let mut tables_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
         for pool in &cfg.pools {
             let t = LookupTable::build(&pool.backends, 17).unwrap();
-            tables.insert(pool.id.clone(), Arc::new(ArcSwap::from_pointee(t)));
+            tables_map.insert(pool.id.clone(), Arc::new(t));
         }
+        let tables: LookupTables = Arc::new(ArcSwap::from_pointee(tables_map));
         let health = Arc::new(DashMap::new());
         let mock = Arc::new(MockAnnouncer::default());
         let mut ctl =
@@ -877,8 +921,8 @@ mod tests {
         );
         controller.flush_pending();
 
-        assert_eq!(tables[&pool_a].load().num_backends(), 2); // 10.0.0.2, 10.0.0.3
-        assert_eq!(tables[&pool_b].load().num_backends(), 3); // unchanged
-        assert_eq!(tables[&pool_c].load().num_backends(), 2); // unchanged
+        assert_eq!(tables.load()[&pool_a].num_backends(), 2); // 10.0.0.2, 10.0.0.3
+        assert_eq!(tables.load()[&pool_b].num_backends(), 3); // unchanged
+        assert_eq!(tables.load()[&pool_c].num_backends(), 2); // unchanged
     }
 }

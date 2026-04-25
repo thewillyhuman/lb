@@ -25,13 +25,12 @@ use axum::{
     Json, Router,
 };
 use dashmap::DashMap;
+use lb_config_manager::applier::LookupTables;
 use lb_forwarder::tracer::{trace_packet, TraceInputs};
 use lb_forwarder::vip_matcher::VipMatcher;
-use lb_hashing::LookupTable;
 use lb_metrics::LbMetrics;
 use lb_tracer::{TraceRequest, TraceResult};
-use lb_types::{BackendPoolId, HealthStatus};
-use std::collections::HashMap;
+use lb_types::HealthStatus;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -54,7 +53,7 @@ pub struct OpsState {
     /// cheap: the inner `ArcSwap`/`DashMap`/HashMap-of-`ArcSwap` values are
     /// already shared.
     pub vip_matcher: Arc<ArcSwap<VipMatcher>>,
-    pub lookup_tables: Arc<HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>>,
+    pub lookup_tables: LookupTables,
     pub health_status: Arc<DashMap<IpAddr, HealthStatus>>,
 }
 
@@ -127,7 +126,9 @@ async fn trace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lb_types::{Backend, Protocol};
+    use lb_hashing::LookupTable;
+    use lb_types::{Backend, BackendPoolId, Protocol};
+    use std::collections::HashMap;
     use std::net::Ipv4Addr;
     use std::sync::atomic::AtomicBool;
 
@@ -147,14 +148,15 @@ mod tests {
             Some((vip_ip, pool_name, backends)) => {
                 let lookup = LookupTable::build(&backends, 17).unwrap();
                 let id = BackendPoolId(pool_name.into());
-                let mut tables = HashMap::new();
-                tables.insert(id.clone(), Arc::new(ArcSwap::from_pointee(lookup)));
+                let mut tables_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
+                tables_map.insert(id.clone(), Arc::new(lookup));
+                let tables: LookupTables = Arc::new(ArcSwap::from_pointee(tables_map));
                 let matcher = VipMatcher::from_entries(vec![(vip_ip, Protocol::Tcp, 443, id)]);
-                (Arc::new(ArcSwap::from_pointee(matcher)), Arc::new(tables))
+                (Arc::new(ArcSwap::from_pointee(matcher)), tables)
             }
             None => (
                 Arc::new(ArcSwap::from_pointee(VipMatcher::new())),
-                Arc::new(HashMap::new()),
+                Arc::new(ArcSwap::from_pointee(HashMap::new())) as LookupTables,
             ),
         };
         OpsState {

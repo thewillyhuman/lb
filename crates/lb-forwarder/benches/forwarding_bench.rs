@@ -1,5 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use crossbeam::queue::ArrayQueue;
+use lb_config_manager::applier::LookupTables;
 use lb_forwarder::conn_table::ConnTable;
 use lb_forwarder::gre;
 use lb_forwarder::threading::{ForwarderSharedState, MultiThreadedForwarder};
@@ -572,10 +573,7 @@ fn bench_rewriter_to_muxer_hop(c: &mut Criterion) {
 // Thread-to-thread: full pipeline with MockIo (Mutex) and MockIoLockFree
 // ---------------------------------------------------------------------------
 
-fn make_shared_state() -> (
-    HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
-    VipMatcher,
-) {
+fn make_shared_state() -> (LookupTables, VipMatcher) {
     let vip_ip = IpAddr::V4(Ipv4Addr::new(188, 184, 100, 10));
     let pool_id = BackendPoolId("web".into());
 
@@ -584,11 +582,9 @@ fn make_shared_state() -> (
         .collect();
     let lookup_table = LookupTable::build(&backends, lb_hashing::DEFAULT_TABLE_SIZE).unwrap();
 
-    let mut tables = HashMap::new();
-    tables.insert(
-        pool_id.clone(),
-        Arc::new(ArcSwap::from_pointee(lookup_table)),
-    );
+    let mut tables_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
+    tables_map.insert(pool_id.clone(), Arc::new(lookup_table));
+    let tables: LookupTables = Arc::new(ArcSwap::from_pointee(tables_map));
 
     let vip_matcher = VipMatcher::from_entries(vec![(vip_ip, Protocol::Tcp, 443, pool_id)]);
 

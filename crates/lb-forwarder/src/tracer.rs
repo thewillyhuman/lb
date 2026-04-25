@@ -23,10 +23,9 @@
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use lb_hashing::LookupTable;
+use lb_config_manager::applier::LookupTables;
 use lb_tracer::{TraceRequest, TraceResult};
-use lb_types::{BackendPoolId, HealthStatus, PacketMeta};
-use std::collections::HashMap;
+use lb_types::{HealthStatus, PacketMeta};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -40,7 +39,7 @@ use crate::vip_matcher::VipMatcher;
 pub struct TraceInputs<'a> {
     pub node_id: &'a str,
     pub vip_matcher: &'a Arc<ArcSwap<VipMatcher>>,
-    pub lookup_tables: &'a HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
+    pub lookup_tables: &'a LookupTables,
     pub health_status: &'a Arc<DashMap<IpAddr, HealthStatus>>,
 }
 
@@ -83,7 +82,8 @@ pub fn trace_packet(req: &TraceRequest, inputs: &TraceInputs<'_>) -> TraceResult
     let pool_id_str = pool_id.0.clone();
     steps.push(format!("VIP matched → pool `{pool_id_str}`"));
 
-    let Some(lookup_swap) = inputs.lookup_tables.get(pool_id) else {
+    let lookup_snap = inputs.lookup_tables.load();
+    let Some(lookup) = lookup_snap.get(pool_id) else {
         steps.push(format!(
             "pool `{pool_id_str}` has no lookup table (config-reload race?) — packet would be dropped"
         ));
@@ -96,7 +96,6 @@ pub fn trace_packet(req: &TraceRequest, inputs: &TraceInputs<'_>) -> TraceResult
             steps,
         };
     };
-    let lookup = lookup_swap.load();
     let backend = lookup.lookup(flow_hash);
     steps.push(format!(
         "Maglev lookup → {} (flow_hash=0x{:016x})",
@@ -131,17 +130,18 @@ pub fn trace_packet(req: &TraceRequest, inputs: &TraceInputs<'_>) -> TraceResult
 mod tests {
     use super::*;
     use lb_hashing::LookupTable;
-    use lb_types::{Backend, Protocol};
+    use lb_types::{Backend, BackendPoolId, Protocol};
+    use std::collections::HashMap;
     use std::net::Ipv4Addr;
 
-    type Tables = HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>;
     type Matcher = Arc<ArcSwap<VipMatcher>>;
 
-    fn with_pool(pool_id: &str, backends: Vec<Backend>) -> (Tables, Matcher) {
+    fn with_pool(pool_id: &str, backends: Vec<Backend>) -> (LookupTables, Matcher) {
         let lookup = LookupTable::build(&backends, 17).unwrap();
-        let mut tables = HashMap::new();
+        let mut tables_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
         let id = BackendPoolId(pool_id.into());
-        tables.insert(id.clone(), Arc::new(ArcSwap::from_pointee(lookup)));
+        tables_map.insert(id.clone(), Arc::new(lookup));
+        let tables: LookupTables = Arc::new(ArcSwap::from_pointee(tables_map));
         let matcher = VipMatcher::from_entries(vec![(
             IpAddr::V4(Ipv4Addr::new(188, 184, 100, 10)),
             Protocol::Tcp,

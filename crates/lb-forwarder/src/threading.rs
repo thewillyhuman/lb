@@ -20,15 +20,11 @@ use crate::steering;
 use crate::vip_matcher::VipMatcher;
 use crate::ForwarderConfig;
 use crossbeam::queue::ArrayQueue;
-use lb_hashing::LookupTable;
+use lb_config_manager::applier::LookupTables;
 use lb_io::{PacketBuf, PacketIo};
 use lb_metrics::ForwarderMetrics;
 use lb_types::packet;
-use lb_types::{
-    BackendPoolId, ConnTtls, FlowProto, FragmentId, HealthStatus, PacketMeta, TcpFlags,
-    TcpFlowState,
-};
-use std::collections::HashMap;
+use lb_types::{ConnTtls, FlowProto, FragmentId, HealthStatus, PacketMeta, TcpFlags, TcpFlowState};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -54,7 +50,7 @@ const PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_micros(100);
 
 /// Shared state passed to the multi-threaded forwarder.
 pub struct ForwarderSharedState {
-    pub lookup_tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
+    pub lookup_tables: LookupTables,
     pub vip_matcher: Arc<ArcSwap<VipMatcher>>,
     pub health_status: Arc<DashMap<IpAddr, HealthStatus>>,
     pub metrics: ForwarderMetrics,
@@ -253,7 +249,7 @@ struct RewriterContext {
     conn_ttls: ConnTtls,
     fragment_table_size: usize,
     fragment_ttl: Duration,
-    lookup_tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
+    lookup_tables: LookupTables,
     vip_matcher: Arc<ArcSwap<VipMatcher>>,
     health_status: Arc<DashMap<IpAddr, HealthStatus>>,
     metrics: ForwarderMetrics,
@@ -293,6 +289,10 @@ fn run_rewriter(ctx: RewriterContext, shutdown: &AtomicBool) {
         spin_count = 0;
 
         let vip_matcher = ctx.vip_matcher.load();
+        // Snapshot the pool→table map once per batch. Cheap inner-`Arc`
+        // clones at the lookup site keep references valid even if the
+        // controller swaps the map mid-batch.
+        let lookup_tables = ctx.lookup_tables.load();
         let now = std::time::Instant::now();
 
         for &idx in &indices {
@@ -362,15 +362,14 @@ fn run_rewriter(ctx: RewriterContext, shutdown: &AtomicBool) {
             };
 
             // Get lookup table
-            let lookup_table_swap = match ctx.lookup_tables.get(pool_id) {
-                Some(lt) => lt,
+            let lookup_table = match lookup_tables.get(pool_id) {
+                Some(lt) => lt.clone(),
                 None => {
                     ctx.metrics.packets_dropped.inc();
                     ctx.pool.free(idx);
                     continue;
                 }
             };
-            let lookup_table = lookup_table_swap.load();
 
             let flow_hash = meta.flow_hash();
             let proto = FlowProto::from(meta.protocol);
@@ -583,7 +582,8 @@ mod tests {
     use super::*;
     use lb_hashing::LookupTable;
     use lb_io::mock::mock_io;
-    use lb_types::{Backend, Protocol};
+    use lb_types::{Backend, BackendPoolId, Protocol};
+    use std::collections::HashMap;
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
@@ -613,11 +613,9 @@ mod tests {
         let lookup_table = LookupTable::build(&backends, 17).unwrap();
         let pool_id = BackendPoolId("web".into());
 
-        let mut tables = HashMap::new();
-        tables.insert(
-            pool_id.clone(),
-            Arc::new(ArcSwap::from_pointee(lookup_table)),
-        );
+        let mut tables_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
+        tables_map.insert(pool_id.clone(), Arc::new(lookup_table));
+        let tables: LookupTables = Arc::new(ArcSwap::from_pointee(tables_map));
 
         let vip_matcher = crate::vip_matcher::VipMatcher::from_entries(vec![(
             IpAddr::V4(Ipv4Addr::new(188, 184, 100, 10)),
@@ -694,11 +692,9 @@ mod tests {
         let lookup_table = LookupTable::build(&backends, 17).unwrap();
         let pool_id = BackendPoolId("web".into());
 
-        let mut tables = HashMap::new();
-        tables.insert(
-            pool_id.clone(),
-            Arc::new(ArcSwap::from_pointee(lookup_table)),
-        );
+        let mut tables_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
+        tables_map.insert(pool_id.clone(), Arc::new(lookup_table));
+        let tables: LookupTables = Arc::new(ArcSwap::from_pointee(tables_map));
 
         let vip_matcher = crate::vip_matcher::VipMatcher::from_entries(vec![(
             IpAddr::V4(Ipv4Addr::new(188, 184, 100, 10)),

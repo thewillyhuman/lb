@@ -11,6 +11,7 @@ lb-hashing = { workspace = true }
 lb-io = { workspace = true }
 lb-metrics = { workspace = true }
 lb-tracer = { workspace = true }
+lb-config-manager = { workspace = true }
 arc-swap = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }

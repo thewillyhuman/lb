@@ -4,6 +4,7 @@ use crate::gre;
 use crate::icmp;
 use crate::mss_clamp::{self, ClampResult};
 use crate::vip_matcher::VipMatcher;
+use lb_config_manager::applier::LookupTables;
 use lb_hashing::LookupTable;
 use lb_io::PacketBuf;
 use lb_metrics::ForwarderMetrics;
@@ -25,7 +26,10 @@ pub struct RewriterThread {
     src_ip: IpAddr,
     conn_table: ConnTable,
     fragment_table: FragmentTable,
-    lookup_tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
+    /// Atomically swappable map of pool id → lookup table. The whole map
+    /// rotates on config change (so new pools added at runtime reach the
+    /// data plane), reads are one `ArcSwap::load()` per batch.
+    lookup_tables: LookupTables,
     vip_matcher: Arc<ArcSwap<VipMatcher>>,
     health_status: Arc<DashMap<IpAddr, HealthStatus>>,
     metrics: ForwarderMetrics,
@@ -41,7 +45,7 @@ impl RewriterThread {
         conn_ttls: ConnTtls,
         fragment_table_size: usize,
         fragment_ttl: Duration,
-        lookup_tables: HashMap<BackendPoolId, Arc<ArcSwap<LookupTable>>>,
+        lookup_tables: LookupTables,
         vip_matcher: Arc<ArcSwap<VipMatcher>>,
         health_status: Arc<DashMap<IpAddr, HealthStatus>>,
         metrics: ForwarderMetrics,
@@ -66,13 +70,22 @@ impl RewriterThread {
     /// ICMP responses for oversized packets are also placed into the output.
     pub fn process_batch(&mut self, packets: &mut [PacketBuf]) -> usize {
         let vip_matcher = self.vip_matcher.load();
+        // Snapshot the lookup-table map once per batch; the inner
+        // `Arc<LookupTable>` clones in `process_one` keep references valid
+        // even if the map is swapped mid-batch.
+        let lookup_tables = self.lookup_tables.load();
         let now = std::time::Instant::now();
         let mut write_idx = 0;
 
         for read_idx in 0..packets.len() {
             self.metrics.packets_received.inc();
 
-            match self.process_one(&packets[read_idx].clone(), &vip_matcher, now) {
+            match self.process_one(
+                &packets[read_idx].clone(),
+                &vip_matcher,
+                &lookup_tables,
+                now,
+            ) {
                 ProcessResult::Forwarded(pkt) => {
                     packets[write_idx] = pkt;
                     write_idx += 1;
@@ -108,6 +121,7 @@ impl RewriterThread {
         &mut self,
         input: &PacketBuf,
         vip_matcher: &VipMatcher,
+        lookup_tables: &HashMap<BackendPoolId, Arc<LookupTable>>,
         now: std::time::Instant,
     ) -> ProcessResult {
         // Non-first fragment (offset > 0) has no L4 header, so PacketMeta
@@ -164,11 +178,10 @@ impl RewriterThread {
         }
 
         // Backend selection (connection table + Maglev)
-        let lookup_table_swap = match self.lookup_tables.get(pool_id) {
-            Some(lt) => lt,
+        let lookup_table = match lookup_tables.get(pool_id) {
+            Some(lt) => lt.clone(),
             None => return ProcessResult::Dropped,
         };
-        let lookup_table = lookup_table_swap.load();
 
         let flow_hash = meta.flow_hash();
         let proto = FlowProto::from(meta.protocol);
@@ -383,11 +396,9 @@ mod tests {
         let lookup_table = LookupTable::build(&backends, 17).unwrap();
         let pool_id = BackendPoolId("web".into());
 
-        let mut tables = HashMap::new();
-        tables.insert(
-            pool_id.clone(),
-            Arc::new(ArcSwap::from_pointee(lookup_table)),
-        );
+        let mut tables_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
+        tables_map.insert(pool_id.clone(), Arc::new(lookup_table));
+        let tables: LookupTables = Arc::new(ArcSwap::from_pointee(tables_map));
 
         let vip_matcher = VipMatcher::from_entries(vec![(vip_ip(), Protocol::Tcp, 443, pool_id)]);
 
@@ -479,11 +490,9 @@ mod tests {
         ];
         let lookup_table = LookupTable::build(&backends, 17).unwrap();
         let pool_id = BackendPoolId("web".into());
-        let mut tables = HashMap::new();
-        tables.insert(
-            pool_id.clone(),
-            Arc::new(ArcSwap::from_pointee(lookup_table)),
-        );
+        let mut tables_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
+        tables_map.insert(pool_id.clone(), Arc::new(lookup_table));
+        let tables: LookupTables = Arc::new(ArcSwap::from_pointee(tables_map));
         let vip_matcher = VipMatcher::from_entries(vec![(vip_ip(), Protocol::Tcp, 443, pool_id)]);
         let mut registry = prometheus_client::registry::Registry::default();
         let metrics = ForwarderMetrics::register(&mut registry);
@@ -578,11 +587,9 @@ mod tests {
         ];
         let lookup_table = LookupTable::build(&backends, 17).unwrap();
         let pool_id = BackendPoolId("web".into());
-        let mut tables = HashMap::new();
-        tables.insert(
-            pool_id.clone(),
-            Arc::new(ArcSwap::from_pointee(lookup_table)),
-        );
+        let mut tables_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
+        tables_map.insert(pool_id.clone(), Arc::new(lookup_table));
+        let tables: LookupTables = Arc::new(ArcSwap::from_pointee(tables_map));
         let vip_matcher = VipMatcher::from_entries(vec![(vip_ip(), Protocol::Tcp, 443, pool_id)]);
         let mut registry = prometheus_client::registry::Registry::default();
         let metrics = ForwarderMetrics::register(&mut registry);
@@ -609,7 +616,8 @@ mod tests {
         // Read the cached backend, then mark it unhealthy.
         let cached = {
             let pool_id = BackendPoolId("web".into());
-            let lt = rewriter.lookup_tables.get(&pool_id).unwrap().load();
+            let snap = rewriter.lookup_tables.load();
+            let lt = snap.get(&pool_id).unwrap();
             let hash = PacketMeta::from_ipv4_bytes(
                 build_tcp_packet([10, 0, 0, 123], [188, 184, 100, 10], 44444, 443).as_slice(),
             )
@@ -818,11 +826,9 @@ mod tests {
         let lookup_table = LookupTable::build(&backends, 17).unwrap();
         let pool_id = BackendPoolId("web".into());
 
-        let mut tables = HashMap::new();
-        tables.insert(
-            pool_id.clone(),
-            Arc::new(ArcSwap::from_pointee(lookup_table)),
-        );
+        let mut tables_map: HashMap<BackendPoolId, Arc<LookupTable>> = HashMap::new();
+        tables_map.insert(pool_id.clone(), Arc::new(lookup_table));
+        let tables: LookupTables = Arc::new(ArcSwap::from_pointee(tables_map));
 
         let vip_matcher = VipMatcher::from_entries(vec![
             (vip_ip(), Protocol::Tcp, 443, pool_id.clone()),
