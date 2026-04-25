@@ -9,12 +9,20 @@ publish.workspace = true
 [features]
 default = ["mock"]
 mock = ["dep:crossbeam"]
-af-xdp = ["dep:libbpf-sys", "dep:libc"]
+# `af-xdp` pulls in the actual XSK ring plumbing. Linux-only; the
+# `xdpilone` dep is gated under `target.'cfg(target_os = "linux")'`
+# below, and our `af_xdp.rs` re-gates with `cfg(target_os = "linux")` so
+# non-Linux dev builds stay clean even with the feature flag forced on
+# in a workspace `Cargo.toml`.
+af-xdp = ["dep:libc", "dep:xdpilone", "dep:smallvec"]
 
 [dependencies]
-libbpf-sys = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 crossbeam = { workspace = true, optional = true }
+smallvec = { version = "1", optional = true }
 tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+xdpilone = { workspace = true, optional = true }
 
 [dev-dependencies]
