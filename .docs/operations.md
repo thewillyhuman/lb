@@ -26,7 +26,7 @@ The LB node uses two configuration files:
 | `data_iface` | string | -- | NIC used for packet forwarding |
 | `num_threads` | integer | `7` | Number of packet rewriter threads |
 | `metrics_addr` | string | `127.0.0.1:9100` | Bind address for `/healthz`, `/readyz`, `/metrics`. Use `0.0.0.0:9100` for cross-host scrape |
-| `io_backend` | string | `mock` | `"mock"` (in-memory queues, dev/test) or `"af_xdp"` (production direction; scaffold today — returns `Unsupported` at startup) |
+| `io_backend` | string | `mock` | `"mock"` (in-memory queues, dev/test) or `"af_xdp"` (production). AF_XDP requires building with `--features af-xdp` and running `deploy/xdp/load.sh <iface>` once on the host before startup; see [Loading the XDP redirect program](#loading-the-xdp-redirect-program-af_xdp-only). |
 | `cpu_affinity` | table | unset | Optional per-role CPU pinning (`steering`, `rewriters`, `muxer`). See [CPU pinning](#cpu-pinning). |
 
 #### `[bgp]`
@@ -411,7 +411,23 @@ The unit file:
 
 ### Thread layout
 
-The LB node spawns the following threads:
+The LB node uses one of two threading models depending on the I/O backend:
+
+**Per-queue (AF_XDP)**: each rewriter owns its own AF_XDP socket bound
+to one kernel queue. The kernel's RSS hardware hash partitions traffic
+across queues, so userspace steering would just add latency. No
+inter-thread queues, no `PacketPool`; each thread runs `recv_batch →
+process_batch → send_batch` inline.
+
+| Thread | Name | Role |
+|--------|------|------|
+| Rewriter 0..N | `lb-rewriter-{i}` | Bound to queue *i*. RX, conn-table lookup, Maglev, GRE encap, TX. |
+| Config watcher | `lb-config-watcher` | Watch config file, trigger reload |
+| Main | -- | Monitors thread health, signal handling |
+
+**Steering+muxer (mock IO, tests)**: a single shared NIC handle for RX
+and TX, with userspace steering distributing 4-byte frame indices to
+per-rewriter SPSC queues.
 
 | Thread | Name | Role |
 |--------|------|------|
@@ -421,7 +437,7 @@ The LB node spawns the following threads:
 | Config watcher | `lb-config-watcher` | Watch config file, trigger reload |
 | Main | -- | Monitors thread health, signal handling |
 
-SPSC queues between threads carry 4-byte frame indices (`FrameIndex = u32`), not 2KB packet buffers. Packet data lives in a shared `PacketPool` arena and is mutated in-place by whichever thread holds the index. This eliminates the ~166ns/packet memcpy overhead that dominated inter-thread handoff with full `PacketBuf` queues.
+SPSC queues in the steering+muxer model carry 4-byte frame indices, not 2KB packet buffers, eliminating the ~166ns/packet memcpy overhead.
 
 #### CPU pinning
 
