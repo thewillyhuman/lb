@@ -104,6 +104,11 @@ fn main() {
     // the node is fully primed.
     let ready = Arc::new(AtomicBool::new(false));
 
+    // Shared shutdown signal. The SIGTERM/SIGINT handler flips this so
+    // long-running blocking threads (e.g. the config watcher) can exit
+    // cleanly instead of being torn down mid-syscall by `process::exit`.
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+
     // Try to load initial LB config (per ADR-001: from local file)
     let initial_lb_config = if config.control_plane.config_file.exists() {
         match ConfigWatcher::new(&config.control_plane.config_file) {
@@ -385,19 +390,21 @@ fn main() {
             });
         }
 
-        // Watcher thread: sync, inotify-driven. Feeds `config_tx`. Stops when
-        // the channel is closed (i.e., on process shutdown).
+        // Watcher thread: sync, inotify-driven. Feeds `config_tx`. Stops on
+        // either an explicit shutdown signal or the apply-task channel
+        // closing.
+        let watcher_shutdown = Arc::clone(&shutdown_flag);
         std::thread::Builder::new()
             .name("lb-config-watcher".into())
             .spawn(move || {
                 tracing::info!("config file watcher started");
-                loop {
-                    let new_config = watcher.wait_for_change();
+                while let Some(new_config) = watcher.wait_for_change(&watcher_shutdown) {
                     if config_tx.send(new_config).is_err() {
                         tracing::info!("config apply-task gone, watcher exiting");
-                        break;
+                        return;
                     }
                 }
+                tracing::info!("config watcher stopping (shutdown or channel closed)");
             })
             .expect("failed to spawn config watcher thread");
     }
@@ -413,6 +420,7 @@ fn main() {
         let controller_for_signal = Arc::clone(&controller);
         let bgp_speaker_for_signal = Arc::clone(&bgp_speaker);
         let forwarder_for_signal = Arc::clone(&forwarder);
+        let shutdown_for_signal = Arc::clone(&shutdown_flag);
         bgp_handle.spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
             let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
@@ -422,6 +430,11 @@ fn main() {
                 _ = sigint.recv() => "SIGINT",
             };
             tracing::info!(%signame, "received shutdown signal, draining");
+
+            // Tell the config watcher (and any other thread polling this
+            // flag) to stop. They unwind cleanly before `process::exit`
+            // pulls the rug.
+            shutdown_for_signal.store(true, std::sync::atomic::Ordering::Relaxed);
 
             // 1. Withdraw VIPs. Best-effort; the speaker writes to each peer
             //    session's mpsc channel and returns immediately.
