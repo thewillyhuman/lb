@@ -1,0 +1,94 @@
+name: supply-chain
+
+# Runs the security/quality gates that don't belong in the fast PR feedback
+# loop in `ci.yml`: vulnerability scan, license + dep policy, and code
+# coverage. Coverage is informational (uploaded as an artifact) — failing the
+# build on a coverage delta is more friction than it's worth at this stage.
+#
+# Triggers:
+#   * every PR (so policy regressions get caught at review time)
+#   * weekly schedule (so newly-published advisories are surfaced even when
+#     no PRs are landing — the lockfile may not have changed but the advisory
+#     database has)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Mondays at 06:00 UTC.
+    - cron: '0 6 * * 1'
+
+concurrency:
+  group: supply-chain-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version ^0.21
+      # `--deny warnings` so unmaintained-crate notices fail the build, not
+      # just RUSTSEC vulnerabilities. Tighten/loosen via `deny.toml`'s
+      # advisories table if a specific advisory needs to be acknowledged.
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version ^0.16
+      - name: cargo deny check
+        # `bans`, `licenses`, `sources`, `advisories`. Configured in `deny.toml`.
+        run: cargo deny check
+
+  coverage:
+    name: code coverage
+    runs-on: ubuntu-latest
+    # Coverage is informational. Don't block PRs on it — the goal is to
+    # surface uncovered code paths, not gatekeep on a single number.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked --version ^0.6
+      - name: Generate coverage (LCOV)
+        # `--workspace --all-targets` mirrors the ci.yml test job so the
+        # coverage report reflects what CI exercises. `--no-fail-fast` so a
+        # single flaky test doesn't blank the whole report.
+        run: |
+          cargo llvm-cov --workspace --all-targets --no-fail-fast --lcov \
+            --output-path lcov.info
+      - name: Generate summary
+        run: cargo llvm-cov report --summary-only | tee coverage-summary.txt
+      - name: Upload LCOV
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: |
+            lcov.info
+            coverage-summary.txt
+          retention-days: 14
