@@ -346,19 +346,23 @@ All logs are emitted via `tracing` with structured fields. Set `RUST_LOG=info` (
 
 ### Systemd
 
-A ready-to-use unit file is at `deploy/lb-node.service`. Install it:
+A ready-to-use unit file is at `deploy/lb-node.service`. The service runs as a dedicated unprivileged `lb-node` user with capabilities granted explicitly — create the user first, then install the unit:
 
 ```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin lb-node
+sudo install -d -o lb-node -g lb-node /var/lib/lb
 sudo cp deploy/lb-node.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now lb-node
 ```
 
-The unit file includes:
-- Pre-start config validation (`--check-config`)
-- Restart on failure with backoff
-- File descriptor and memory lock limits for kernel bypass
-- Security hardening (ProtectSystem, PrivateTmp, etc.)
+The unit file:
+
+- Runs as `User=lb-node` with `NoNewPrivileges=yes`. Production-ready capabilities are granted via `AmbientCapabilities=`: `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_NET_BIND_SERVICE`, `CAP_SYS_RESOURCE`, `CAP_BPF`, `CAP_PERFMON`. (Drop the last two on kernels older than 5.8 where they didn't exist.)
+- Pre-start config validation (`--check-config`).
+- Restart on failure with backoff.
+- File descriptor and memory lock limits sized for kernel bypass.
+- Hardening: `ProtectSystem=strict`, `ProtectKernelTunables`, `ProtectKernelModules`, `RestrictNamespaces`, `MemoryDenyWriteExecute`, `SystemCallFilter=@system-service @network-io` (subtracting `@privileged @resources @reboot @swap @debug`).
 
 ### Thread layout
 
