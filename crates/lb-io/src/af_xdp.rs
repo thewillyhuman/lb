@@ -80,6 +80,14 @@ mod inner {
         pub frame_size: u32,
         /// Size of the RX and TX rings (slots per ring).
         pub ring_size: u32,
+        /// Path to the pinned XSKMAP that the XDP redirect program is
+        /// using to dispatch packets. `AfXdpIo::new` opens this map and
+        /// inserts its own XSK fd at index `queue_id`, so packets the
+        /// kernel-side program sends here actually arrive on this
+        /// socket. `None` means "operator populated the map by hand
+        /// (via bpftool); don't touch it" — useful for early bring-up
+        /// or non-standard deployments.
+        pub xskmap_pin: Option<String>,
     }
 
     impl Default for AfXdpConfig {
@@ -90,6 +98,8 @@ mod inner {
                 num_frames: DEFAULT_NUM_FRAMES,
                 frame_size: DEFAULT_FRAME_SIZE,
                 ring_size: DEFAULT_RING_SIZE,
+                // Matches the path `deploy/xdp/load.sh` pins to.
+                xskmap_pin: Some("/sys/fs/bpf/lb/xsks_map".into()),
             }
         }
     }
@@ -227,12 +237,31 @@ mod inner {
                 free_frames.push_back(i);
             }
 
+            // Self-register in the pinned XSKMAP so the redirect program
+            // can dispatch traffic to us. Without this step, the kernel-
+            // side program runs but `bpf_redirect_map` returns map-miss
+            // and packets fall through to XDP_PASS — i.e. the LB sees
+            // nothing. `xskmap_pin = None` skips this for operators who
+            // populate the map by hand (e.g. via bpftool).
+            let xsk_fd = rx.as_raw_fd();
+            if let Some(pin_path) = &config.xskmap_pin {
+                xskmap::register_xsk(pin_path, config.queue_id, xsk_fd).map_err(|e| {
+                    io::Error::other(format!(
+                        "XSKMAP registration at {pin_path:?} for queue {} failed: {e}. \
+                         Did you run deploy/xdp/load.sh on this host?",
+                        config.queue_id
+                    ))
+                })?;
+            }
+
             tracing::info!(
                 iface = %config.iface,
                 queue_id = config.queue_id,
                 num_frames = config.num_frames,
                 frame_size = config.frame_size,
                 ring_size = config.ring_size,
+                xskmap_pin = ?config.xskmap_pin,
+                xsk_fd,
                 "AF_XDP socket bound; FILL pre-filled with {num_rx_frames} frames"
             );
 
@@ -427,6 +456,104 @@ mod inner {
         }
     }
 
+    /// Tiny helper module for talking to a pinned XSKMAP via the `bpf(2)`
+    /// syscall. Pulled out so the `unsafe` is contained; the public
+    /// surface is just `register_xsk(pin_path, queue_id, xsk_fd)`.
+    mod xskmap {
+        use std::ffi::CString;
+        use std::io;
+        use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+
+        // bpf(2) command numbers from `<linux/bpf.h>`. We hard-code rather
+        // than pull libbpf-sys for two constants.
+        const BPF_MAP_UPDATE_ELEM: libc::c_uint = 2;
+        const BPF_OBJ_GET: libc::c_uint = 7;
+
+        /// `union bpf_attr` sub-shape used by `BPF_OBJ_GET`. Only the
+        /// `pathname` field matters for us; the rest are zero.
+        #[repr(C)]
+        struct BpfAttrObjGet {
+            pathname: u64, // user pointer to NUL-terminated path
+            bpf_fd: u32,
+            file_flags: u32,
+            _pad: [u8; 100], // bpf_attr is large; zero-pad to be safe
+        }
+
+        /// `union bpf_attr` sub-shape used by `BPF_MAP_UPDATE_ELEM`.
+        #[repr(C)]
+        struct BpfAttrMapUpdate {
+            map_fd: u32,
+            _pad0: u32,
+            key: u64,   // user pointer
+            value: u64, // user pointer
+            flags: u64,
+            _pad1: [u8; 88],
+        }
+
+        unsafe fn sys_bpf<T>(cmd: libc::c_uint, attr: &T) -> io::Result<libc::c_long> {
+            let ret = libc::syscall(
+                libc::SYS_bpf,
+                cmd,
+                attr as *const T as *const libc::c_void,
+                std::mem::size_of::<T>() as libc::c_uint,
+            );
+            if ret < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(ret)
+            }
+        }
+
+        /// Open the pinned XSKMAP and insert `xsk_fd` at `queue_id`.
+        ///
+        /// On any error, the kernel-side state is left untouched —
+        /// either the pin doesn't exist (operator forgot to run
+        /// `load.sh`), the path isn't a map (something else is pinned
+        /// there), or the user lacks `CAP_BPF` (or root).
+        pub fn register_xsk(pin_path: &str, queue_id: u32, xsk_fd: RawFd) -> io::Result<()> {
+            let cpath = CString::new(pin_path)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pin path has NUL"))?;
+
+            let attr_get = BpfAttrObjGet {
+                pathname: cpath.as_ptr() as u64,
+                bpf_fd: 0,
+                file_flags: 0,
+                _pad: [0; 100],
+            };
+            // Safety: bpf(2) is a kernel ABI; our struct mirrors a
+            // prefix of `union bpf_attr` and the kernel reads only the
+            // fields it needs (which we set; the rest are zero).
+            let map_fd = unsafe { sys_bpf(BPF_OBJ_GET, &attr_get) }?;
+            // Wrap the returned fd in OwnedFd so it gets closed even on
+            // error paths. `as RawFd` is sound because BPF_OBJ_GET
+            // returns a non-negative fd on success.
+            let map_fd = unsafe { OwnedFd::from_raw_fd(map_fd as RawFd) };
+
+            let key: u32 = queue_id;
+            let value: u32 = xsk_fd as u32;
+            let attr_upd = BpfAttrMapUpdate {
+                map_fd: map_fd.as_raw_fd() as u32,
+                _pad0: 0,
+                key: &key as *const u32 as u64,
+                value: &value as *const u32 as u64,
+                flags: 0, // BPF_ANY
+                _pad1: [0; 88],
+            };
+            // Safety: same as above; map_fd is a valid kernel fd, key
+            // and value are u32 stack locals alive until syscall return.
+            unsafe { sys_bpf(BPF_MAP_UPDATE_ELEM, &attr_upd) }?;
+
+            // OwnedFd dropped here closes the map fd; the entry persists
+            // because the map is also held by the pinned reference and
+            // the live XSK fd.
+            Ok(())
+        }
+
+        // Make OwnedFd::from_raw_fd available without adding an extra
+        // import at the call site.
+        use std::os::fd::FromRawFd;
+    }
+
     /// Allocate a page-aligned uninitialized byte slice on the heap.
     /// `Umem::new` requires page alignment; `Box::new_uninit_slice` only
     /// guarantees the alignment of the element type (1 for `u8`).
@@ -472,6 +599,7 @@ mod stub {
         pub num_frames: u32,
         pub frame_size: u32,
         pub ring_size: u32,
+        pub xskmap_pin: Option<String>,
     }
 
     impl Default for AfXdpConfig {
@@ -482,6 +610,7 @@ mod stub {
                 num_frames: 4096,
                 frame_size: PACKET_BUF_SIZE as u32,
                 ring_size: 2048,
+                xskmap_pin: Some("/sys/fs/bpf/lb/xsks_map".into()),
             }
         }
     }

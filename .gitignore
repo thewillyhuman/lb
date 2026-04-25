@@ -20,3 +20,6 @@ Thumbs.db
 .env
 .env.*
 .claude/
+
+# XDP build artifact (regenerated via `make -C deploy/xdp`)
+deploy/xdp/*.o
