@@ -327,7 +327,15 @@ impl PeerSessionCtx {
             IpAddr::V4(_) => tokio::net::TcpSocket::new_v4().map_err(BgpError::Io)?,
             IpAddr::V6(_) => tokio::net::TcpSocket::new_v6().map_err(BgpError::Io)?,
         };
-        if let Some(password) = self.peer.md5_password.as_deref() {
+        // `resolved_md5_password` reads from `md5_password_env` when set;
+        // both validation (mutually-exclusive, env var present) and the
+        // actual lookup happen here so a misconfigured peer is reported as
+        // a clear connect-time error rather than silently peering plain.
+        let md5 = self
+            .peer
+            .resolved_md5_password()
+            .map_err(|e| BgpError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+        if let Some(password) = md5.as_deref() {
             apply_tcp_md5sig(&tcp_sock, self.peer.peer_ip, password).map_err(BgpError::Io)?;
         }
 
@@ -704,6 +712,7 @@ mod tests {
                     communities: None,
                     enabled: true,
                     md5_password: None,
+                    md5_password_env: None,
                 })
                 .collect(),
         }

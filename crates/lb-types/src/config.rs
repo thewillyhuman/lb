@@ -102,10 +102,52 @@ pub struct BgpPeerConfig {
     /// TCP_MD5SIG_MAXKEYLEN). Linux-only; on other OSes the speaker logs a
     /// warning and falls back to plain TCP.
     ///
-    /// *Treat the config file as a secret* — anyone with read access can
-    /// impersonate this peer.
+    /// **Prefer `md5_password_env`** — putting the literal secret here
+    /// means anyone with read access to the TOML file can impersonate this
+    /// peer. If you do use `md5_password`, lock the config to mode `0600`
+    /// and audit who has access.
     #[serde(default)]
     pub md5_password: Option<String>,
+    /// Name of an environment variable holding the TCP-MD5 password.
+    /// Resolved at startup; mutually exclusive with `md5_password`.
+    ///
+    /// Use this when you'd rather not check the secret into the config
+    /// file — typical setup is a systemd `EnvironmentFile=` pointing at a
+    /// separately-locked-down file (e.g. `/etc/lb/bgp.env` mode `0600`),
+    /// so the TOML stays world-readable for ops convenience while the
+    /// secret stays protected. The variable must be set when the process
+    /// starts; missing or empty is a fatal config error rather than a
+    /// silent fall-back to unauthenticated peering.
+    #[serde(default)]
+    pub md5_password_env: Option<String>,
+}
+
+impl BgpPeerConfig {
+    /// Resolve the effective TCP-MD5 password, reading from the env var
+    /// named by `md5_password_env` when set. Errors if both fields are set
+    /// (mutually exclusive) or if the named env var is missing/empty.
+    /// `Ok(None)` means MD5 is not configured for this peer.
+    pub fn resolved_md5_password(&self) -> Result<Option<String>, String> {
+        match (&self.md5_password, &self.md5_password_env) {
+            (Some(_), Some(_)) => Err(format!(
+                "peer {}: md5_password and md5_password_env are mutually exclusive",
+                self.peer_ip
+            )),
+            (Some(p), None) => Ok(Some(p.clone())),
+            (None, Some(var)) => match std::env::var(var) {
+                Ok(v) if !v.is_empty() => Ok(Some(v)),
+                Ok(_) => Err(format!(
+                    "peer {}: env var ${var} is empty (md5_password_env)",
+                    self.peer_ip
+                )),
+                Err(_) => Err(format!(
+                    "peer {}: env var ${var} not set (md5_password_env)",
+                    self.peer_ip
+                )),
+            },
+            (None, None) => Ok(None),
+        }
+    }
 }
 
 fn default_bgp_port() -> u16 {
@@ -164,6 +206,7 @@ impl<'de> Deserialize<'de> for BgpConfig {
                 communities: None,
                 enabled: true,
                 md5_password: None,
+                md5_password_env: None,
             }],
             (None, None, None) => {
                 return Err(serde::de::Error::custom(
@@ -615,6 +658,90 @@ peer_asn = 65000
         let cfg: BgpConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.peers[0].md5_password.as_deref(), Some("s3cret"));
         assert_eq!(cfg.peers[1].md5_password, None);
+    }
+
+    #[test]
+    fn bgp_accepts_md5_password_env() {
+        let toml_str = r#"
+local_asn = 65000
+router_id = "10.0.0.1"
+[[peers]]
+peer_ip = "10.0.0.254"
+peer_asn = 65000
+md5_password_env = "LB_BGP_KEY_PEER_A"
+"#;
+        let cfg: BgpConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.peers[0].md5_password, None);
+        assert_eq!(
+            cfg.peers[0].md5_password_env.as_deref(),
+            Some("LB_BGP_KEY_PEER_A")
+        );
+    }
+
+    #[test]
+    fn resolved_md5_password_prefers_inline_when_alone() {
+        let p = BgpPeerConfig {
+            peer_ip: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            peer_asn: 65000,
+            port: 179,
+            hold_time_secs: None,
+            communities: None,
+            enabled: true,
+            md5_password: Some("inline".into()),
+            md5_password_env: None,
+        };
+        assert_eq!(p.resolved_md5_password().unwrap(), Some("inline".into()));
+    }
+
+    #[test]
+    fn resolved_md5_password_reads_env_var() {
+        // Pick a uniquely-named var so we don't collide with concurrent tests.
+        let name = "LB_TEST_BGP_KEY_4f6a";
+        std::env::set_var(name, "from-env");
+        let p = BgpPeerConfig {
+            peer_ip: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            peer_asn: 65000,
+            port: 179,
+            hold_time_secs: None,
+            communities: None,
+            enabled: true,
+            md5_password: None,
+            md5_password_env: Some(name.into()),
+        };
+        assert_eq!(p.resolved_md5_password().unwrap(), Some("from-env".into()));
+        std::env::remove_var(name);
+    }
+
+    #[test]
+    fn resolved_md5_password_errors_when_env_missing() {
+        let p = BgpPeerConfig {
+            peer_ip: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            peer_asn: 65000,
+            port: 179,
+            hold_time_secs: None,
+            communities: None,
+            enabled: true,
+            md5_password: None,
+            md5_password_env: Some("LB_TEST_MISSING_VAR_b71d".into()),
+        };
+        let err = p.resolved_md5_password().unwrap_err();
+        assert!(err.contains("not set"), "got: {err}");
+    }
+
+    #[test]
+    fn resolved_md5_password_rejects_both_set() {
+        let p = BgpPeerConfig {
+            peer_ip: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            peer_asn: 65000,
+            port: 179,
+            hold_time_secs: None,
+            communities: None,
+            enabled: true,
+            md5_password: Some("inline".into()),
+            md5_password_env: Some("X".into()),
+        };
+        let err = p.resolved_md5_password().unwrap_err();
+        assert!(err.contains("mutually exclusive"));
     }
 
     #[test]
