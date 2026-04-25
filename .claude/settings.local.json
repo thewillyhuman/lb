@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:static.googleusercontent.com)",
+      "WebFetch(domain:sre.google)"
+    ]
+  }
+}
