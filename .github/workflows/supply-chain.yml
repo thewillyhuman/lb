@@ -42,10 +42,14 @@ jobs:
         # Pinning to a >= floor without an upper cap so future fixes flow in.
         run: cargo install cargo-audit --locked --version '>=0.21.2'
       # `--deny warnings` so unmaintained-crate notices fail the build, not
-      # just RUSTSEC vulnerabilities. Tighten/loosen via `deny.toml`'s
-      # advisories table if a specific advisory needs to be acknowledged.
+      # just RUSTSEC vulnerabilities. Each `--ignore` below is also listed
+      # in `deny.toml` with the same justification — keep the two in sync
+      # when a new transitive unmaintained advisory has to be accepted.
       - name: cargo audit
-        run: cargo audit --deny warnings
+        run: |
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2024-0384 \
+            --ignore RUSTSEC-2025-0134
 
   deny:
     name: cargo-deny

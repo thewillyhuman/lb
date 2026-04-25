@@ -19,6 +19,12 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+# These are internal workspace crates, not crates.io publications. Setting
+# `publish = false` at the workspace level (inherited by every crate via
+# `publish.workspace = true`) lets `cargo deny`'s `allow-wildcard-paths`
+# exemption apply — workspace path deps are wildcards by definition, but
+# they're safe because the path is pinned in the root `Cargo.toml`.
+publish = false
 # Minimum supported Rust version. CI's `dtolnay/rust-toolchain@stable`
 # always tracks the current stable, so this is a *floor*, not a target.
 # 1.87 is the floor we actually use today: `u32::is_multiple_of` and
