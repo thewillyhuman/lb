@@ -37,7 +37,10 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked --version ^0.21
+        # 0.21+ understands CVSS v4.0 vectors. Older versions choke parsing
+        # 2026-era advisories (e.g. RUSTSEC-2026-0073) that ship `cvss = "CVSS:4.0/..."`.
+        # Pinning to a >= floor without an upper cap so future fixes flow in.
+        run: cargo install cargo-audit --locked --version '>=0.21.2'
       # `--deny warnings` so unmaintained-crate notices fail the build, not
       # just RUSTSEC vulnerabilities. Tighten/loosen via `deny.toml`'s
       # advisories table if a specific advisory needs to be acknowledged.
@@ -54,7 +57,9 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked --version ^0.16
+        # 0.16.4+ pulls in rustsec >= 0.30 which understands CVSS v4.0 vectors.
+        # Earlier versions fail on 2026-era advisories like RUSTSEC-2026-0073.
+        run: cargo install cargo-deny --locked --version '>=0.16.4'
       - name: cargo deny check
         # `bans`, `licenses`, `sources`, `advisories`. Configured in `deny.toml`.
         run: cargo deny check
