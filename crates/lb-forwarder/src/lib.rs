@@ -34,6 +34,16 @@ pub struct ForwarderConfig {
     pub batch_size: usize,
     pub mtu_config: MtuConfig,
     pub icmp_rate_limit: u32,
+    /// Optional per-role CPU pinning. `None` keeps OS scheduler defaults.
+    pub cpu_affinity: Option<CpuAffinity>,
+}
+
+/// Per-role CPU IDs. Empty list = no pinning for that role.
+#[derive(Debug, Clone, Default)]
+pub struct CpuAffinity {
+    pub steering: Vec<usize>,
+    pub rewriters: Vec<usize>,
+    pub muxer: Vec<usize>,
 }
 
 /// Single-threaded forwarder engine.
@@ -179,6 +189,7 @@ mod tests {
             batch_size: 64,
             mtu_config: MtuConfig::new(1500).unwrap(),
             icmp_rate_limit: 100,
+            cpu_affinity: None,
         };
 
         let mut engine = ForwarderEngine::new(

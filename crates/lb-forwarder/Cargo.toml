@@ -17,6 +17,7 @@ parking_lot = { workspace = true }
 xxhash-rust = { workspace = true }
 crossbeam = { workspace = true }
 tracing = { workspace = true }
+core_affinity = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

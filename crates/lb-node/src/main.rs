@@ -256,6 +256,15 @@ fn main() {
         batch_size: config.forwarder.batch_size,
         mtu_config,
         icmp_rate_limit: config.forwarder.icmp_rate_limit,
+        cpu_affinity: config
+            .node
+            .cpu_affinity
+            .as_ref()
+            .map(|c| lb_forwarder::CpuAffinity {
+                steering: c.steering.clone(),
+                rewriters: c.rewriters.clone(),
+                muxer: c.muxer.clone(),
+            }),
     };
 
     // Start the multi-threaded forwarder against the configured I/O backend.

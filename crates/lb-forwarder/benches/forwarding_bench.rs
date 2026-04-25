@@ -638,6 +638,7 @@ fn bench_thread_to_thread_mutex(c: &mut Criterion) {
                     batch_size: 64,
                     mtu_config: lb_types::MtuConfig::new(1500).unwrap(),
                     icmp_rate_limit: 100,
+                    cpu_affinity: None,
                 };
 
                 // Start forwarder (includes pool allocation) BEFORE timing
@@ -700,6 +701,7 @@ fn bench_thread_to_thread_lockfree(c: &mut Criterion) {
                     batch_size: 64,
                     mtu_config: lb_types::MtuConfig::new(1500).unwrap(),
                     icmp_rate_limit: 100,
+                    cpu_affinity: None,
                 };
 
                 // Start forwarder (includes pool allocation) BEFORE timing

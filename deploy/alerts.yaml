@@ -1,0 +1,128 @@
+# Prometheus alert templates for lb-node.
+#
+# Drop into a Prometheus rules file (e.g. `/etc/prometheus/rules/lb-node.yaml`).
+# Tune thresholds for your traffic profile — the defaults below are sized for a
+# datacenter-class deployment (10k+ rps per node) and will produce noise at
+# small scale. The `for:` durations bias against single-scrape blips; raise
+# them on flaky probes.
+groups:
+  - name: lb-node-availability
+    rules:
+      - alert: LbNodeDown
+        expr: up{job="lb-node"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "lb-node {{ $labels.instance }} is not scraping"
+          description: "Prometheus has not scraped {{ $labels.instance }} for 2 minutes. ECMP will route around it but capacity is reduced."
+
+      - alert: LbNodeNotReady
+        # /readyz drives this via lb_node_ready (1 = ready). Synthesize from
+        # `up` if you don't yet expose a `ready` gauge — see operations.md.
+        expr: lb_node_ready == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "lb-node {{ $labels.instance }} is up but not ready"
+          description: "Forwarder running but config not applied or readyz failing. Check lb-node logs."
+
+  - name: lb-node-bgp
+    rules:
+      - alert: LbBgpAllPeersDown
+        expr: lb_bgp_state == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "All BGP peers down on {{ $labels.instance }}"
+          description: "No peer is Established. VIPs will be withdrawn from the upstream router. Holds up traffic on this node."
+
+      - alert: LbBgpPeerDown
+        expr: lb_bgp_peer_state == 0
+        for: 5m
+        labels:
+          severity: warn
+        annotations:
+          summary: "BGP peer {{ $labels.peer_ip }} down on {{ $labels.instance }}"
+          description: "Single peer flap may indicate router-side issue or MD5 misconfiguration. Cross-check `lb_bgp_peer_notifications_total` for the reason code."
+
+      - alert: LbBgpAnnounceFailures
+        expr: rate(lb_bgp_announce_failures_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warn
+        annotations:
+          summary: "BGP announce failures on {{ $labels.instance }}"
+          description: "Speaker is reporting failed announces — VIP set drift between this node and the router. Likely peer queue stall."
+
+  - name: lb-node-forwarder
+    rules:
+      - alert: LbForwarderHighDropRate
+        expr: |
+          rate(lb_packets_dropped_total[5m])
+          /
+          clamp_min(rate(lb_packets_received_total[5m]), 1) > 0.01
+        for: 5m
+        labels:
+          severity: warn
+        annotations:
+          summary: "lb-node {{ $labels.instance }} dropping >1% of received packets"
+          description: "Drops can be backend health (acceptable for a brief flap) or backpressure (worrying). Cross-check `lb_connection_table_evictions_total{reason=\"dropped_full\"}`."
+
+      - alert: LbConnTableFillHigh
+        # 50% fill = 5000 basis points. Robin Hood probes start to lengthen
+        # past this, and at 70%+ insert latency tails up sharply.
+        expr: lb_connection_table_fill_bp > 7000
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: "Conn table > 70% full on {{ $labels.instance }}"
+          description: "Bump `[forwarder].connection_table_size` (must be a power of two) before insertion latency tail blows up. See operations.md sizing guidance."
+
+      - alert: LbConnTableEvictionsDroppedFull
+        expr: rate(lb_connection_table_evictions_total{reason="dropped_full"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Conn table fully exhausted on {{ $labels.instance }}"
+          description: "Robin Hood probe path failed end-to-end; flow falls back to pure Maglev (no flow stickiness). Either size the table up or attack mitigation is overdue."
+
+      - alert: LbIcmpFragNeededRateLimited
+        expr: rate(lb_icmp_frag_needed_ratelimited_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: "PMTUD ICMPs being rate-limited on {{ $labels.instance }}"
+          description: "Either `[forwarder].icmp_rate_limit` is too low for legitimate traffic, or someone is shipping a lot of oversized DF-set packets. Check rate of lb_packets_oversized_dropped_total."
+
+  - name: lb-node-control-plane
+    rules:
+      - alert: LbHealthCheckerStalled
+        # Health checker bumps a per-backend `lb_health_probe_total` on every
+        # tick; if no probes fire for 2 minutes, the checker has stalled and
+        # health-driven Maglev rebuilds will not happen.
+        expr: |
+          increase(lb_health_probes_total[2m]) == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Health checker stalled on {{ $labels.instance }}"
+          description: "No health probes have fired for 5 minutes. Backend failures will not flap pools. Restart lb-node."
+
+      - alert: LbConfigReloadFailing
+        # `[node]` watcher logs at `error!` on failed reloads. Bridge into a
+        # counter via the JSON log → metrics adapter, or alert on the log
+        # stream directly via Loki / Promtail.
+        expr: rate(lb_config_reload_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warn
+        annotations:
+          summary: "Config reloads failing on {{ $labels.instance }}"
+          description: "lb-config.json is being rejected by the validator. Check the validator output via `--check-config` against the latest file."

@@ -18,7 +18,7 @@ use crate::gre;
 use crate::packet_pool::{FrameIndex, PacketPool};
 use crate::steering;
 use crate::vip_matcher::VipMatcher;
-use crate::ForwarderConfig;
+use crate::{CpuAffinity, ForwarderConfig};
 use crossbeam::queue::ArrayQueue;
 use lb_hashing::LookupTable;
 use lb_io::{PacketBuf, PacketIo};
@@ -91,6 +91,13 @@ impl MultiThreadedForwarder {
         let shutdown = Arc::new(AtomicBool::new(false));
         let num_rewriters = num_rewriters.max(1);
 
+        // Resolve the operator-supplied CPU IDs against the IDs the OS
+        // actually exposes; out-of-range entries are logged-and-skipped so a
+        // dev-laptop config with `cpu_affinity` set doesn't have to be edited
+        // before running on smaller hardware.
+        let affinity = config.cpu_affinity.clone().unwrap_or_default();
+        let resolved_affinity = resolve_cpu_affinity(&affinity, num_rewriters);
+
         // Shared packet pool — sized to cover all in-flight frames:
         // queue capacity × (rx + tx per rewriter) + batch headroom
         let pool_size = QUEUE_CAPACITY * num_rewriters * 2 + config.batch_size * 2;
@@ -113,11 +120,13 @@ impl MultiThreadedForwarder {
             let shutdown = Arc::clone(&shutdown);
             let vip_matcher = Arc::clone(&vip_matcher);
             let pool = Arc::clone(&pool);
+            let pin = resolved_affinity.steering;
 
             handles.push(
                 thread::Builder::new()
                     .name("lb-steering".into())
                     .spawn(move || {
+                        pin_current_thread("lb-steering", pin);
                         run_steering(
                             &mut rx_io,
                             &rx_queues,
@@ -148,11 +157,14 @@ impl MultiThreadedForwarder {
                 health_status: Arc::clone(&health_status),
                 metrics: metrics.clone(),
             };
+            let name = format!("lb-rewriter-{i}");
+            let pin = resolved_affinity.rewriters.get(i).copied().flatten();
 
             handles.push(
                 thread::Builder::new()
-                    .name(format!("lb-rewriter-{i}"))
+                    .name(name.clone())
                     .spawn(move || {
+                        pin_current_thread(&name, pin);
                         run_rewriter(ctx, &shutdown);
                     })
                     .expect("failed to spawn rewriter thread"),
@@ -164,11 +176,13 @@ impl MultiThreadedForwarder {
             let tx_queues = tx_queues.clone();
             let shutdown = Arc::clone(&shutdown);
             let pool = Arc::clone(&pool);
+            let pin = resolved_affinity.muxer;
 
             handles.push(
                 thread::Builder::new()
                     .name("lb-muxer".into())
                     .spawn(move || {
+                        pin_current_thread("lb-muxer", pin);
                         run_muxer(&mut tx_io, &tx_queues, &pool, batch_size, &shutdown);
                     })
                     .expect("failed to spawn muxer thread"),
@@ -578,6 +592,63 @@ fn run_muxer<T: PacketIo>(
     }
 }
 
+/// Resolved per-role pinning, after validating operator IDs against
+/// `core_affinity::get_core_ids()`. `None` for a role means "OS default".
+struct ResolvedAffinity {
+    steering: Option<core_affinity::CoreId>,
+    rewriters: Vec<Option<core_affinity::CoreId>>,
+    muxer: Option<core_affinity::CoreId>,
+}
+
+fn resolve_cpu_affinity(req: &CpuAffinity, num_rewriters: usize) -> ResolvedAffinity {
+    let cores = core_affinity::get_core_ids().unwrap_or_default();
+    let resolve_one = |id: usize, role: &str| -> Option<core_affinity::CoreId> {
+        match cores.iter().find(|c| c.id == id) {
+            Some(c) => Some(*c),
+            None => {
+                tracing::warn!(
+                    role,
+                    requested = id,
+                    available = cores.len(),
+                    "cpu_affinity ID not exposed by OS, ignoring"
+                );
+                None
+            }
+        }
+    };
+    let pick_first = |list: &[usize], role: &str| -> Option<core_affinity::CoreId> {
+        list.iter().find_map(|&id| resolve_one(id, role))
+    };
+    let rewriters = (0..num_rewriters)
+        .map(|i| {
+            if req.rewriters.is_empty() {
+                None
+            } else {
+                let id = req.rewriters[i % req.rewriters.len()];
+                resolve_one(id, "rewriter")
+            }
+        })
+        .collect();
+    ResolvedAffinity {
+        steering: pick_first(&req.steering, "steering"),
+        rewriters,
+        muxer: pick_first(&req.muxer, "muxer"),
+    }
+}
+
+fn pin_current_thread(label: &str, core: Option<core_affinity::CoreId>) {
+    let Some(c) = core else { return };
+    if core_affinity::set_for_current(c) {
+        tracing::info!(thread = label, cpu = c.id, "pinned to CPU");
+    } else {
+        tracing::warn!(
+            thread = label,
+            cpu = c.id,
+            "set_for_current failed (insufficient capability?)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,6 +709,7 @@ mod tests {
             batch_size: 64,
             mtu_config: lb_types::MtuConfig::new(1500).unwrap(),
             icmp_rate_limit: 100,
+            cpu_affinity: None,
         };
 
         // Inject packets before starting
@@ -719,6 +791,7 @@ mod tests {
             batch_size: 64,
             mtu_config: lb_types::MtuConfig::new(1500).unwrap(),
             icmp_rate_limit: 100,
+            cpu_affinity: None,
         };
 
         // Inject 50 packets from the SAME flow
