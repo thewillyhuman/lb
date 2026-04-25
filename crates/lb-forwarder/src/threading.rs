@@ -22,7 +22,7 @@ use crate::ForwarderConfig;
 use crossbeam::queue::ArrayQueue;
 use lb_hashing::LookupTable;
 use lb_io::{PacketBuf, PacketIo};
-use lb_metrics::{EvictionLabels, ForwarderMetrics, TcpTransitionLabels};
+use lb_metrics::ForwarderMetrics;
 use lb_types::packet;
 use lb_types::{
     BackendPoolId, ConnTtls, FlowProto, FragmentId, HealthStatus, PacketMeta, TcpFlags,
@@ -489,20 +489,10 @@ fn insert_tracked(
         }
         InsertResult::EvictedExpired => {
             metrics.conn_table_inserts_total.inc();
-            metrics
-                .conn_table_evictions_total
-                .get_or_create(&EvictionLabels {
-                    reason: "expired_on_insert".into(),
-                })
-                .inc();
+            metrics.eviction_expired_on_insert.inc();
         }
         InsertResult::DroppedFull => {
-            metrics
-                .conn_table_evictions_total
-                .get_or_create(&EvictionLabels {
-                    reason: "dropped_full".into(),
-                })
-                .inc();
+            metrics.eviction_dropped_full.inc();
         }
     }
 }
@@ -517,32 +507,17 @@ fn apply_tcp_transitions(
 ) {
     if flags.rst() {
         conn_table.mark_closing(hash, now);
-        metrics
-            .conn_table_tcp_transitions_total
-            .get_or_create(&TcpTransitionLabels {
-                to: "closing_rst".into(),
-            })
-            .inc();
+        metrics.tcp_transition_closing_rst.inc();
         return;
     }
     if flags.fin() {
         conn_table.mark_closing(hash, now);
-        metrics
-            .conn_table_tcp_transitions_total
-            .get_or_create(&TcpTransitionLabels {
-                to: "closing_fin".into(),
-            })
-            .inc();
+        metrics.tcp_transition_closing_fin.inc();
         return;
     }
     if flags.ack() && !flags.syn() {
         conn_table.mark_established(hash, now);
-        metrics
-            .conn_table_tcp_transitions_total
-            .get_or_create(&TcpTransitionLabels {
-                to: "established".into(),
-            })
-            .inc();
+        metrics.tcp_transition_established.inc();
     }
 }
 
