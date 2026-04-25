@@ -240,7 +240,10 @@ mod tests {
         shutdown.store(true, Ordering::Relaxed);
 
         let result = join.join().expect("watcher thread panicked");
-        assert!(result.is_none(), "expected None on shutdown, got {result:?}");
+        assert!(
+            result.is_none(),
+            "expected None on shutdown, got {result:?}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
