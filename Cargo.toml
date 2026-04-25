@@ -19,6 +19,12 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+# Minimum supported Rust version. Bump only when a feature we adopt
+# materially improves the codebase — `let`-chains (1.88), let-else
+# (1.65), and pure-Rust libc TCP_MD5SIG (1.66) are all already in our
+# baseline. CI's `dtolnay/rust-toolchain@stable` always tracks the
+# current stable, so this is a *floor*, not a target.
+rust-version = "1.85"
 
 [workspace.dependencies]
 # Workspace crates
