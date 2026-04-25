@@ -90,6 +90,12 @@ fn main() {
         "starting lb-node"
     );
 
+    // If any peer holds a literal MD5 secret in this TOML, the file must
+    // not be world- or group-readable. Refuse to boot rather than warn —
+    // an inline secret in a `0644` file is a credential leak waiting to
+    // happen, and the operator's intent (literal vs env-var) is explicit.
+    check_node_config_perms(&cli.config, &config);
+
     // Shared state between forwarder (data plane) and controller (control plane)
     let health_status: Arc<DashMap<IpAddr, HealthStatus>> = Arc::new(DashMap::new());
     let vip_matcher = Arc::new(ArcSwap::from_pointee(VipMatcher::new()));
@@ -502,4 +508,37 @@ fn apply_lb_config(
     // Build and swap VIP matcher
     let new_matcher = build_vip_matcher(config);
     vip_matcher.store(Arc::new(new_matcher));
+}
+
+/// If any peer carries an inline `md5_password`, refuse to boot when the
+/// node config TOML is group/other-readable. Has no effect on platforms
+/// without Unix permission bits.
+fn check_node_config_perms(path: &PathBuf, config: &NodeConfig) {
+    let any_inline_secret = config.bgp.peers.iter().any(|p| p.md5_password.is_some());
+    if !any_inline_secret {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("failed to stat config file {path:?} for perm check: {e}");
+                std::process::exit(1);
+            }
+        };
+        // Reject any group/other read or any-bits write. `0o077` covers
+        // group-read|write|exec + other-read|write|exec; we want zero
+        // bits set in that range.
+        let mode = meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "node config {path:?} has insecure permissions {mode:o} but contains an inline \
+                 BGP md5_password — restrict to 0600 (chown root:root, chmod 600) or move the \
+                 secret to md5_password_env",
+            );
+            std::process::exit(1);
+        }
+    }
 }

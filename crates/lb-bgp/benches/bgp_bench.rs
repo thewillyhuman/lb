@@ -22,6 +22,7 @@ fn build_config(ports: &[u16]) -> BgpConfig {
                 communities: None,
                 enabled: true,
                 md5_password: None,
+                md5_password_env: None,
             })
             .collect(),
     }
