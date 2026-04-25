@@ -20,6 +20,21 @@ pub struct Backend {
     pub port: u16,
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// Operator-initiated drain. When `true`, the backend is excluded
+    /// from the next Maglev rebuild (no new flows land here) but is *not*
+    /// marked unhealthy — the rewriter's per-packet health check still
+    /// returns "healthy", so existing connection-tracking entries
+    /// pointing at this backend complete naturally on the connection's
+    /// own timeline rather than getting force-rehashed.
+    ///
+    /// Use this when an operator is taking a backend out of rotation
+    /// for maintenance: flip `drain = true` in `lb-config.json`, wait
+    /// for the connection-table TTL to elapse (operations doc has the
+    /// procedure), then take the backend down. Compare with
+    /// `HealthStatus::Unhealthy`, which the *health checker* sets
+    /// automatically and which forces existing flows to rehash.
+    #[serde(default)]
+    pub drain: bool,
 }
 
 fn default_weight() -> u32 {
@@ -32,6 +47,7 @@ impl Backend {
             ip,
             port,
             weight: 1,
+            drain: false,
         }
     }
 

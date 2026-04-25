@@ -28,24 +28,36 @@ pub fn build_lookup_tables_for_pools(
     let mut tables = HashMap::new();
 
     for pool in pools {
-        let healthy_backends: Vec<Backend> = pool
+        // Two reasons to exclude a backend from the new lookup table:
+        //  1. Health checker has marked it `Unhealthy` (automatic).
+        //  2. Operator has set `drain = true` in the config (manual).
+        // The "assume healthy unless explicitly Unhealthy" default for
+        // never-probed backends is preserved.
+        let active_backends: Vec<Backend> = pool
             .backends
             .iter()
             .filter(|b| {
+                if b.drain {
+                    return false;
+                }
                 health_status
                     .get(&b.ip)
                     .map(|s| *s != HealthStatus::Unhealthy)
-                    .unwrap_or(true) // assume healthy if no status yet
+                    .unwrap_or(true)
             })
             .cloned()
             .collect();
 
-        if healthy_backends.is_empty() {
-            // If all backends are unhealthy, use all backends as fallback
+        if active_backends.is_empty() {
+            // No usable backends — fall back to *all* of them, including
+            // unhealthy/drained, so traffic still has somewhere to go.
+            // This matches the existing "all-unhealthy fallback" behaviour
+            // and keeps the safety property: a misconfigured pool prefers
+            // best-effort routing over total drop.
             if let Ok(table) = LookupTable::build(&pool.backends, table_size) {
                 tables.insert(pool.id.clone(), Arc::new(table));
             }
-        } else if let Ok(table) = LookupTable::build(&healthy_backends, table_size) {
+        } else if let Ok(table) = LookupTable::build(&active_backends, table_size) {
             tables.insert(pool.id.clone(), Arc::new(table));
         }
     }
@@ -106,6 +118,39 @@ mod tests {
         let tables = build_lookup_tables(&config, &health, 17);
         assert!(tables.contains_key(&BackendPoolId("web".into())));
         assert_eq!(tables[&BackendPoolId("web".into())].num_backends(), 3);
+    }
+
+    #[test]
+    fn drained_backend_is_excluded_from_lookup_table() {
+        let mut config = make_config();
+        // Mark 10.0.0.2 as drained.
+        config.pools[0].backends[1].drain = true;
+        let health = HashMap::new();
+        let tables = build_lookup_tables(&config, &health, 65537);
+        let table = &tables[&BackendPoolId("web".into())];
+        assert_eq!(table.num_backends(), 2);
+        // The drained IP must not appear in the lookup output.
+        let drained = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        for hash in 0..1000u64 {
+            assert_ne!(table.lookup(hash).ip, drained);
+        }
+    }
+
+    #[test]
+    fn all_drained_falls_back_to_all_backends() {
+        let mut config = make_config();
+        for b in &mut config.pools[0].backends {
+            b.drain = true;
+        }
+        let health = HashMap::new();
+        let tables = build_lookup_tables(&config, &health, 17);
+        // Same fallback semantics as all-unhealthy: serve traffic, the
+        // operator clearly didn't intend the LB to black-hole the VIP.
+        // We have to clear the drain bit on the fallback build because
+        // `LookupTable::build` filters weight=0 too — drain doesn't
+        // affect weight today, so this works without further coupling.
+        let table = &tables[&BackendPoolId("web".into())];
+        assert_eq!(table.num_backends(), 3);
     }
 
     #[test]
