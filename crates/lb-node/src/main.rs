@@ -298,34 +298,40 @@ fn main() {
     };
     let forwarder = match config.node.io_backend {
         IoBackend::Mock => {
+            // Mock IO uses the shared steering+muxer model: a single
+            // RX handle feeds N rewriters via SPSC queues, a single TX
+            // handle drains them. Useful for tests; not for production.
             let (rx_io, _rx_handle) = mock_io();
             let (tx_io, _tx_handle) = mock_io();
             MultiThreadedForwarder::start(rx_io, tx_io, fwd_config, num_rewriters, shared)
         }
         IoBackend::AfXdp => {
-            let xdp_cfg = AfXdpConfig {
-                iface: config.node.data_iface.clone(),
-                ..AfXdpConfig::default()
-            };
-            // Fail fast with a clear message — the scaffold returns
-            // `Unsupported` today, so exiting here is the honest response.
-            // When a real implementation lands the same code path will
-            // succeed without further changes.
-            let rx_io = AfXdpIo::new(&xdp_cfg).unwrap_or_else(|e| {
-                eprintln!(
-                    "failed to initialize AF_XDP RX socket on {:?}: {e}",
-                    xdp_cfg.iface
-                );
-                std::process::exit(1);
-            });
-            let tx_io = AfXdpIo::new(&xdp_cfg).unwrap_or_else(|e| {
-                eprintln!(
-                    "failed to initialize AF_XDP TX socket on {:?}: {e}",
-                    xdp_cfg.iface
-                );
-                std::process::exit(1);
-            });
-            MultiThreadedForwarder::start(rx_io, tx_io, fwd_config, num_rewriters, shared)
+            // Per-queue model: one AF_XDP socket per rewriter, bound to
+            // queue 0..num_rewriters on the data interface. The kernel's
+            // RSS hashes incoming packets onto a queue; that queue's
+            // socket lands directly on the matching rewriter thread.
+            // No userspace steering, no inter-thread queues, no double-
+            // bind on a single (iface, queue_id) tuple.
+            let mut ios = Vec::with_capacity(num_rewriters);
+            for queue_id in 0..num_rewriters {
+                let xdp_cfg = AfXdpConfig {
+                    iface: config.node.data_iface.clone(),
+                    queue_id: queue_id as u32,
+                    ..AfXdpConfig::default()
+                };
+                match AfXdpIo::new(&xdp_cfg) {
+                    Ok(io) => ios.push(io),
+                    Err(e) => {
+                        eprintln!(
+                            "failed to initialize AF_XDP socket on {:?} queue {queue_id}: {e}\n\
+                             Did you run deploy/xdp/load.sh on this host?",
+                            xdp_cfg.iface
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            MultiThreadedForwarder::start_per_queue(ios, fwd_config, shared)
         }
     };
     let forwarder = Arc::new(forwarder);

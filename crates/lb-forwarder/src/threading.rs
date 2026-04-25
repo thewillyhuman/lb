@@ -208,6 +208,88 @@ impl MultiThreadedForwarder {
         let handles = self.handles.lock();
         !handles.is_empty() && handles.iter().all(|h| !h.is_finished())
     }
+
+    /// Start in **per-queue** mode: each rewriter thread owns its own
+    /// `PacketIo` handle and runs the full `recv → process → send` loop
+    /// inline. Used by the AF_XDP backend, where the NIC's RSS hardware
+    /// hash already partitions traffic across kernel-side queues — there's
+    /// no value in adding userspace steering on top of that, and binding a
+    /// single (iface, queue) AF_XDP socket from two threads (the
+    /// steering/muxer model below) is a kernel-side error (`EBUSY`).
+    ///
+    /// `ios.len()` determines `num_rewriters`. Each `PacketIo` handle is
+    /// expected to be bound to a distinct kernel queue (e.g. queue 0 for
+    /// rewriter 0, queue 1 for rewriter 1, …). The mock backend can also
+    /// run this way, but tests that need shared in-memory queues should
+    /// stick with [`Self::start`].
+    pub fn start_per_queue<T: PacketIo>(
+        ios: Vec<T>,
+        config: ForwarderConfig,
+        shared: ForwarderSharedState,
+    ) -> Self {
+        assert!(
+            !ios.is_empty(),
+            "start_per_queue requires at least one IO handle"
+        );
+        let ForwarderSharedState {
+            lookup_tables,
+            vip_matcher,
+            health_status,
+            metrics,
+        } = shared;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let num_rewriters = ios.len();
+
+        let affinity = config.cpu_affinity.clone().unwrap_or_default();
+        let resolved_affinity = resolve_cpu_affinity(&affinity, num_rewriters);
+
+        let mut handles = Vec::with_capacity(num_rewriters);
+        for (i, io) in ios.into_iter().enumerate() {
+            let shutdown = Arc::clone(&shutdown);
+            let lookup_tables = lookup_tables.clone();
+            let vip_matcher = Arc::clone(&vip_matcher);
+            let health_status = Arc::clone(&health_status);
+            let metrics = metrics.clone();
+            let conn_ttls = config.conn_ttls;
+            let conn_table_size = config.connection_table_size;
+            let fragment_table_size = config.fragment_table_size;
+            let fragment_ttl = config.fragment_ttl;
+            let mtu_config = config.mtu_config;
+            let icmp_rate_limit = config.icmp_rate_limit;
+            let src_ip = config.src_ip;
+            let batch_size = config.batch_size;
+            let name = format!("lb-rewriter-{i}");
+            let pin = resolved_affinity.rewriters.get(i).copied().flatten();
+
+            handles.push(
+                thread::Builder::new()
+                    .name(name.clone())
+                    .spawn(move || {
+                        pin_current_thread(&name, pin);
+                        let rewriter = crate::rewriter::RewriterThread::new(
+                            src_ip,
+                            conn_table_size,
+                            conn_ttls,
+                            fragment_table_size,
+                            fragment_ttl,
+                            lookup_tables,
+                            vip_matcher,
+                            health_status,
+                            metrics,
+                            mtu_config,
+                            icmp_rate_limit,
+                        );
+                        run_per_queue(io, rewriter, batch_size, &shutdown);
+                    })
+                    .expect("failed to spawn per-queue rewriter thread"),
+            );
+        }
+
+        Self {
+            handles: parking_lot::Mutex::new(handles),
+            shutdown,
+        }
+    }
 }
 
 /// Steering loop: receive packets into pool frames, distribute indices to rewriter queues.
@@ -531,6 +613,46 @@ fn apply_tcp_transitions(
     if flags.ack() && !flags.syn() {
         conn_table.mark_established(hash, now);
         metrics.tcp_transition_established.inc();
+    }
+}
+
+/// Per-queue rewriter loop: this thread owns one `PacketIo` handle and
+/// runs the full pipeline inline — `recv_batch` → `RewriterThread::process_batch`
+/// → `send_batch`. Used by `start_per_queue`. No inter-thread queues, no
+/// PacketPool: the working buffer is a single `Vec<PacketBuf>` reused
+/// across iterations.
+fn run_per_queue<T: PacketIo>(
+    mut io: T,
+    mut rewriter: crate::rewriter::RewriterThread,
+    batch_size: usize,
+    shutdown: &AtomicBool,
+) {
+    let mut buf: Vec<PacketBuf> = vec![PacketBuf::new(); batch_size];
+    let mut spin = 0u32;
+    while !shutdown.load(Ordering::Relaxed) {
+        let n = io.recv_batch(&mut buf).unwrap_or_default();
+        if n == 0 {
+            spin += 1;
+            if spin < SPIN_BEFORE_PARK {
+                std::hint::spin_loop();
+            } else {
+                std::thread::park_timeout(PARK_TIMEOUT);
+                spin = 0;
+            }
+            continue;
+        }
+        spin = 0;
+
+        let processed = rewriter.process_batch(&mut buf[..n]);
+        if processed > 0 {
+            // `send_batch` may return less than processed under
+            // backpressure (AF_XDP COMPLETION drain pace). Just re-try
+            // on the next iteration — packets that didn't go this round
+            // sit in `buf` but will be overwritten by the next recv_batch.
+            // This is correct because under backpressure dropping is
+            // preferable to head-of-line blocking the receive loop.
+            let _ = io.send_batch(&buf[..processed]);
+        }
     }
 }
 
