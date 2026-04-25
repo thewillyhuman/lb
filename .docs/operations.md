@@ -346,6 +346,17 @@ All logs are emitted via `tracing` with structured fields. Set `RUST_LOG=info` (
 
 ## Deployment
 
+The recommended path is **systemd** (below). The container image at
+`ghcr.io/<owner>/lb-node:<version>` exists for CI integration tests and
+for environments that already standardise on container delivery; it
+expects the operator to grant `--cap-add=NET_ADMIN --cap-add=NET_RAW`
+(plus `--cap-add=BPF` for AF_XDP) and to mount `/etc/lb` read-only.
+
+Releases are cut by pushing a `v*` tag to the repo; see
+`.github/workflows/release.yml` for the artifact list (musl x86_64 +
+aarch64 tarballs containing `lb-node` + `lb-trace` + the unit file, plus
+a multi-arch container image).
+
 ### Systemd
 
 A ready-to-use unit file is at `deploy/lb-node.service`. The service runs as a dedicated unprivileged `lb-node` user with capabilities granted explicitly — create the user first, then install the unit:
