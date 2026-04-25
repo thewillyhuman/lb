@@ -6,7 +6,7 @@ use crate::mss_clamp::{self, ClampResult};
 use crate::vip_matcher::VipMatcher;
 use lb_hashing::LookupTable;
 use lb_io::PacketBuf;
-use lb_metrics::{EvictionLabels, ForwarderMetrics, TcpTransitionLabels};
+use lb_metrics::ForwarderMetrics;
 use lb_types::packet;
 use lb_types::{
     BackendPoolId, ConnTtls, FlowProto, FragmentId, HealthStatus, MtuConfig, PacketMeta, TcpFlags,
@@ -296,20 +296,10 @@ impl RewriterThread {
             }
             InsertResult::EvictedExpired => {
                 self.metrics.conn_table_inserts_total.inc();
-                self.metrics
-                    .conn_table_evictions_total
-                    .get_or_create(&EvictionLabels {
-                        reason: "expired_on_insert".into(),
-                    })
-                    .inc();
+                self.metrics.eviction_expired_on_insert.inc();
             }
             InsertResult::DroppedFull => {
-                self.metrics
-                    .conn_table_evictions_total
-                    .get_or_create(&EvictionLabels {
-                        reason: "dropped_full".into(),
-                    })
-                    .inc();
+                self.metrics.eviction_dropped_full.inc();
             }
         }
     }
@@ -320,22 +310,12 @@ impl RewriterThread {
         // attack), the connection is terminated.
         if flags.rst() {
             self.conn_table.mark_closing(hash, now);
-            self.metrics
-                .conn_table_tcp_transitions_total
-                .get_or_create(&TcpTransitionLabels {
-                    to: "closing_rst".into(),
-                })
-                .inc();
+            self.metrics.tcp_transition_closing_rst.inc();
             return;
         }
         if flags.fin() {
             self.conn_table.mark_closing(hash, now);
-            self.metrics
-                .conn_table_tcp_transitions_total
-                .get_or_create(&TcpTransitionLabels {
-                    to: "closing_fin".into(),
-                })
-                .inc();
+            self.metrics.tcp_transition_closing_fin.inc();
             return;
         }
         // ACK without SYN is a good signal the handshake has completed (either
@@ -345,12 +325,7 @@ impl RewriterThread {
         // and a no-op if the state is already Established or Closing.
         if flags.ack() && !flags.syn() {
             self.conn_table.mark_established(hash, now);
-            self.metrics
-                .conn_table_tcp_transitions_total
-                .get_or_create(&TcpTransitionLabels {
-                    to: "established".into(),
-                })
-                .inc();
+            self.metrics.tcp_transition_established.inc();
         }
     }
 }
@@ -543,13 +518,7 @@ mod tests {
         let fin =
             build_tcp_packet_with_flags([10, 0, 0, 100], [188, 184, 100, 10], 11111, 443, 0x11);
         rewriter.process_batch(&mut [fin]);
-        let fin_count = rewriter
-            .metrics
-            .conn_table_tcp_transitions_total
-            .get_or_create(&TcpTransitionLabels {
-                to: "closing_fin".into(),
-            })
-            .get();
+        let fin_count = rewriter.metrics.tcp_transition_closing_fin.get();
         assert_eq!(fin_count, 1);
 
         // The entry should be gone within `tcp_closing`.
@@ -581,13 +550,7 @@ mod tests {
             build_tcp_packet_with_flags([10, 0, 0, 50], [188, 184, 100, 10], 22222, 443, 0x10);
         rewriter.process_batch(&mut [ack]);
 
-        let promoted = rewriter
-            .metrics
-            .conn_table_tcp_transitions_total
-            .get_or_create(&TcpTransitionLabels {
-                to: "established".into(),
-            })
-            .get();
+        let promoted = rewriter.metrics.tcp_transition_established.get();
         assert!(promoted >= 1);
     }
 
@@ -603,13 +566,7 @@ mod tests {
             build_tcp_packet_with_flags([10, 0, 0, 77], [188, 184, 100, 10], 33333, 443, 0x04);
         rewriter.process_batch(&mut [rst]);
 
-        let rst_count = rewriter
-            .metrics
-            .conn_table_tcp_transitions_total
-            .get_or_create(&TcpTransitionLabels {
-                to: "closing_rst".into(),
-            })
-            .get();
+        let rst_count = rewriter.metrics.tcp_transition_closing_rst.get();
         assert_eq!(rst_count, 1);
     }
 

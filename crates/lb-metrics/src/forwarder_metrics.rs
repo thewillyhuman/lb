@@ -15,10 +15,18 @@ pub struct ForwarderMetrics {
     pub conn_table_misses: Counter,
     pub conn_table_size: Gauge,
     pub processing_latency_ns: Histogram,
-    // Connection-tracking details (aligns with Maglev paper §3.3)
+    // Connection-tracking details (aligns with Maglev paper §3.3).
     pub conn_table_inserts_total: Counter,
+    /// Labelled family — kept for the Prometheus exposition. The per-label
+    /// `Counter` handles below are pre-cached so the hot path doesn't
+    /// allocate a `String` for the label key on every increment.
     pub conn_table_evictions_total: Family<EvictionLabels, Counter>,
+    pub eviction_expired_on_insert: Counter,
+    pub eviction_dropped_full: Counter,
     pub conn_table_tcp_transitions_total: Family<TcpTransitionLabels, Counter>,
+    pub tcp_transition_established: Counter,
+    pub tcp_transition_closing_fin: Counter,
+    pub tcp_transition_closing_rst: Counter,
     pub conn_table_fallback_to_maglev_total: Counter,
     pub conn_table_fill_bp: Gauge,
     // MTU handling metrics
@@ -69,8 +77,39 @@ impl ForwarderMetrics {
         let fragment_drop_no_mapping_total = Counter::default();
         let conn_table_inserts_total = Counter::default();
         let conn_table_evictions_total: Family<EvictionLabels, Counter> = Family::default();
+        // Pre-cache the per-label handles. `get_or_create` allocates the
+        // `EvictionLabels` key (one `String`) once at registration time;
+        // the cloned `Counter` shares the underlying atomic with whatever
+        // gets serialised on `/metrics` later.
+        let eviction_expired_on_insert = conn_table_evictions_total
+            .get_or_create(&EvictionLabels {
+                reason: "expired_on_insert".into(),
+            })
+            .clone();
+        let eviction_dropped_full = conn_table_evictions_total
+            .get_or_create(&EvictionLabels {
+                reason: "dropped_full".into(),
+            })
+            .clone();
+
         let conn_table_tcp_transitions_total: Family<TcpTransitionLabels, Counter> =
             Family::default();
+        let tcp_transition_established = conn_table_tcp_transitions_total
+            .get_or_create(&TcpTransitionLabels {
+                to: "established".into(),
+            })
+            .clone();
+        let tcp_transition_closing_fin = conn_table_tcp_transitions_total
+            .get_or_create(&TcpTransitionLabels {
+                to: "closing_fin".into(),
+            })
+            .clone();
+        let tcp_transition_closing_rst = conn_table_tcp_transitions_total
+            .get_or_create(&TcpTransitionLabels {
+                to: "closing_rst".into(),
+            })
+            .clone();
+
         let conn_table_fallback_to_maglev_total = Counter::default();
         let conn_table_fill_bp = Gauge::default();
 
@@ -190,7 +229,12 @@ impl ForwarderMetrics {
             processing_latency_ns,
             conn_table_inserts_total,
             conn_table_evictions_total,
+            eviction_expired_on_insert,
+            eviction_dropped_full,
             conn_table_tcp_transitions_total,
+            tcp_transition_established,
+            tcp_transition_closing_fin,
+            tcp_transition_closing_rst,
             conn_table_fallback_to_maglev_total,
             conn_table_fill_bp,
             mss_clamp_total,
