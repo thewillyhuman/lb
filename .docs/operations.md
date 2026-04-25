@@ -27,6 +27,7 @@ The LB node uses two configuration files:
 | `num_threads` | integer | `7` | Number of packet rewriter threads |
 | `metrics_addr` | string | `127.0.0.1:9100` | Bind address for `/healthz`, `/readyz`, `/metrics`. Use `0.0.0.0:9100` for cross-host scrape |
 | `io_backend` | string | `mock` | `"mock"` (in-memory queues, dev/test) or `"af_xdp"` (production direction; scaffold today — returns `Unsupported` at startup) |
+| `cpu_affinity` | table | unset | Optional per-role CPU pinning (`steering`, `rewriters`, `muxer`). See [CPU pinning](#cpu-pinning). |
 
 #### `[bgp]`
 
@@ -379,7 +380,70 @@ The LB node spawns the following threads:
 
 SPSC queues between threads carry 4-byte frame indices (`FrameIndex = u32`), not 2KB packet buffers. Packet data lives in a shared `PacketPool` arena and is mutated in-place by whichever thread holds the index. This eliminates the ~166ns/packet memcpy overhead that dominated inter-thread handoff with full `PacketBuf` queues.
 
-For best performance, pin each thread to a dedicated CPU core and isolate those cores from the OS scheduler.
+#### CPU pinning
+
+For best performance, pin each thread to a dedicated CPU core and isolate those cores from the OS scheduler. Set `[node.cpu_affinity]` to opt in:
+
+```toml
+[node.cpu_affinity]
+steering  = [1]              # one steering thread → CPU 1
+rewriters = [2, 3, 4, 5, 6]  # one rewriter per CPU; cycles if shorter than num_threads
+muxer     = [7]              # one muxer thread → CPU 7
+```
+
+Each list names OS-level CPU IDs (the IDs Linux exposes via `/sys/devices/system/cpu/`, equivalently the IDs `taskset` accepts). Out-of-range IDs are logged and skipped — the thread runs unpinned rather than refusing to start. If a list is shorter than the number of threads in that role, threads cycle through it (so 3 IDs for 6 rewriters means rewriter `i` lands on `ids[i % 3]`).
+
+Recommended Linux setup:
+
+1. Reserve cores at boot via `isolcpus=2-7,nohz_full=2-7,rcu_nocbs=2-7` on the kernel command line. This stops the OS scheduler from picking them.
+2. Pin IRQs for the data NIC's RX/TX queues to one of the isolated cores via `/proc/irq/$IRQ/smp_affinity_list` (or `irqbalance --banscript=...`). Match the IRQ core(s) to the steering thread's pin so the kernel-side packet path stays on a single L1.
+3. Disable C-states deeper than C1 on the pinned cores: `cpupower idle-set --disable 2..` or `processor.max_cstate=1` on the kernel command line. Tail latency drops sharply when the LLC and TLB stay warm.
+4. Confirm with `ps -L -o pid,tid,psr,comm $(pgrep lb-node)` — each rewriter thread should sit on the configured core.
+
+If `[node.cpu_affinity]` is unset the OS scheduler picks placement, which is fine for dev. At line rate (10+ Mpps) the difference is large enough to dominate the rest of the tuning.
+
+#### Capacity sizing
+
+Rough sizing for an `lb-node` running on AF_XDP (production target). Numbers are per node; ECMP across N nodes scales horizontally.
+
+| Resource | Rule of thumb | Where to tune |
+|----------|--------------|---------------|
+| RX/TX queues per NIC | One pair per rewriter thread | NIC vendor tooling (e.g. `ethtool -L`) |
+| `[node].num_threads` | Reserved cores − 2 (steering + muxer take 1 each) | Node config |
+| `[forwarder].connection_table_size` | ≥ 2× peak concurrent flows, power of two. Aim for ≤ 50% fill ratio (`lb_connection_table_fill_bp` ≤ 5000) | Node config |
+| `[forwarder].fragment_table_size` | Power of two; ≥ peak in-flight fragmented datagrams (~ tens of thousands at 10 Gbps with mixed traffic) | Node config |
+| `[forwarder].batch_size` | 32–64. Larger batches improve throughput but push tail latency up | Node config |
+| `[forwarder].network_mtu` | Match the data interface's MTU. Auto-derives `effective_inner_mtu` and `tcp_mss_clamp` | Node config |
+| Pool size | `QUEUE_CAPACITY (4096) × num_rewriters × 2 + 2 × batch_size` — derived automatically | Implicit |
+| ulimit `MEMLOCK` | At least 1 GB for AF_XDP UMEM | systemd unit (`LimitMEMLOCK=`) |
+
+Typical 10 Gbps, mostly TCP, 1.5M concurrent flows:
+
+```toml
+[node]
+num_threads = 6
+[node.cpu_affinity]
+steering  = [1]
+rewriters = [2, 3, 4, 5, 6, 7]
+muxer     = [8]
+[forwarder]
+connection_table_size = 4194304   # 4M; 2× peak flows
+fragment_table_size   = 65536
+batch_size            = 64
+network_mtu           = 1500
+icmp_rate_limit       = 100
+```
+
+### Alerting
+
+Templates live at `deploy/alerts.yaml`. Drop into `/etc/prometheus/rules/lb-node.yaml` and `promtool check rules` before reloading. Coverage:
+
+- Availability: `LbNodeDown` (page), `LbNodeNotReady` (page).
+- BGP: `LbBgpAllPeersDown` (page), per-peer flap (warn), announce failures (warn).
+- Forwarder: drop rate > 1% (warn), conn-table fill > 70% (warn), conn-table exhaustion (page), ICMP rate-limit hits (warn).
+- Control plane: health checker stalled (page), config reloads failing (warn).
+
+Tune thresholds for your traffic profile — defaults are sized for 10k+ rps. The `for:` durations bias against single-scrape blips; raise them on flaky probes.
 
 ### Multiple instances
 

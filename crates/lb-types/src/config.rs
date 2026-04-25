@@ -35,6 +35,34 @@ pub struct NodeSection {
     /// roadmap. Anything else is a config error.
     #[serde(default)]
     pub io_backend: IoBackend,
+    /// Optional CPU pinning for the forwarder threads. When unset, the OS
+    /// scheduler is left to make placement decisions — fine for dev and
+    /// for low-rate production. At line rate (10+ Mpps) pinning each
+    /// rewriter to its own core yields measurable wins from cache and
+    /// cross-NUMA traffic.
+    #[serde(default)]
+    pub cpu_affinity: Option<CpuAffinityConfig>,
+}
+
+/// Per-role core lists. Each list names the OS-level CPU IDs to pin
+/// threads of that role onto. If a list has more entries than the role has
+/// threads, the extras are ignored; if it has fewer, the remaining
+/// threads cycle through the list (so 2 IDs for 4 rewriters means
+/// rewriter 0/2 → first ID, 1/3 → second).
+///
+/// Empty lists are treated as "no pinning for this role" so partial
+/// configs (e.g. only the rewriters) work without ceremony. CPU IDs are
+/// validated against `core_affinity::get_core_ids` at startup; out-of-
+/// range IDs are logged and skipped rather than refusing to boot.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CpuAffinityConfig {
+    #[serde(default)]
+    pub steering: Vec<usize>,
+    #[serde(default)]
+    pub rewriters: Vec<usize>,
+    #[serde(default)]
+    pub muxer: Vec<usize>,
 }
 
 /// Packet I/O backend selector. Kept as a small enum (not a free-form
